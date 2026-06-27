@@ -1,67 +1,91 @@
 import sys
+# Add the custom framework directory to the system path to import reusable logic modules
 sys.path.append("/lakehouse/default/Files/framework")
 
+# Import custom frameworks for normalization and validation tools (e.g., normalize_name, is_blank)
 from utils import *
 from schema_utils import *
 
+# Import essential python libraries for file parsing and mathematical calculations
 import pandas as pd
 import math
 import builtins
 
+# Define the absolute ABFSS path pointing to the Excel configuration spreadsheet stored in Azure OneLake / Microsoft Fabric
 excel_path = "abfss://ws_dataplatform_dev_dataengg@onelake.dfs.fabric.microsoft.com/lkh_adnan.Lakehouse/Files/LIMS_Config/LIMS_Table_Sturcture_and_Data_Domain_Incremental_Columns_Rowcounts.xlsx"
 
+# Read all distinct sheets from the configuration workbook into separate local Pandas DataFrames
 structure_pdf = pd.read_excel(excel_path, sheet_name="LIMS Table Sturcture")
 domain_pdf = pd.read_excel(excel_path, sheet_name="Domain_Categorization")
 incremental_pdf = pd.read_excel(excel_path, sheet_name="Incremental column")
 row_counts_pdf = pd.read_excel(excel_path, sheet_name="RowCounts")
 
+# Standardise column headers by stripping leading/trailing whitespace across all extracted data sheets
 for pdf in [structure_pdf, domain_pdf, incremental_pdf, row_counts_pdf]:
     pdf.columns = [str(c).strip() for c in pdf.columns]
 
+# Step 1: Cleanse the physical table structures schema data
+# Drop any rows that are missing mandatory column details to avoid data quality errors
 structure_pdf = structure_pdf.dropna(subset=["Table_Name", "ColumnName", "DataType"])
+# Convert columns to their target operational data types and force uniform text casing
 structure_pdf["Table_Name"] = structure_pdf["Table_Name"].astype(str).str.strip().str.upper()
 structure_pdf["ColumnName"] = structure_pdf["ColumnName"].astype(str).str.strip()
 structure_pdf["column_id"] = structure_pdf["column_id"].astype(int)
 
+# Step 2: Build a table-to-domain mapping structure
 table_domain_map = {}
 
+# Iterate over data domain configurations and parse comma-separated table lists into a single lookup dictionary
 for _, row in domain_pdf.iterrows():
     domain = normalize_name(row["Domain"])
     tables = str(row["Tables"]).split(",")
 
     for table in tables:
+        # Map uppercase table name strings directly to their respective normalized data domains
         table_domain_map[str(table).strip().upper()] = domain
 
+# Step 3: Build a tracking high-watermark column lookup structure
 watermark_map = {}
 
+# Iterate over increment configurations to map which columns track modifications per table
 for _, row in incremental_pdf.iterrows():
     table_name = str(row["Table_Name"]).strip().upper()
     watermark_col = row["watermark_coloum"]
 
+    # Only save the mapping if a legitimate tracking column name exists in the sheet cell
     if not is_blank(watermark_col):
         watermark_map[table_name] = str(watermark_col).strip()
 
+# Step 4: Build a total source volume registry mapping structure
 row_count_map = {}
 
+# Map source row counts into memory to dynamically compute sampling sizes for validation stages
 for _, row in row_counts_pdf.iterrows():
     if not is_blank(row["Table_Name"]) and not is_blank(row["Row_Count"]):
         row_count_map[str(row["Table_Name"]).strip().upper()] = int(row["Row_Count"])
 
+# Step 5: Synthesise and construct the final active dataset pipelines array
 dataset_rows = []
 
+# Loop sequentially through sorted, unique source table names discovered in the metadata files
 for source_table in sorted(structure_pdf["Table_Name"].unique()):
+    # Assign the matching data domain to the table, defaulting to 'general' if missing
     domain = table_domain_map.get(source_table, "general")
     entity = normalize_name(source_table)
 
+    # Establish standardized names for the staging landing tables and persistent bronze tables
     landing_table = f"lnd_lims_{domain}_{entity}"
     bronze_table = f"brz_lims_{domain}_{entity}"
 
+    # Determine ingestion architecture logic: incremental if a watermark column exists, otherwise truncate-and-load
     watermark_column = watermark_map.get(source_table)
     load_type = "incremental" if watermark_column else "truncate_load"
 
+    # Evaluate testing limits: Default target to 100 rows if missing, then extract a 1% data sample slice
     source_count = row_count_map.get(source_table, 100)
     sample_count = builtins.max(1, math.ceil(source_count * 0.01))
 
+    # Append the completely generated pipeline metadata definition into the batch collector list
     dataset_rows.append({
         "source_system": "lims7",
         "source_table": source_table,
@@ -76,8 +100,10 @@ for source_table in sorted(structure_pdf["Table_Name"].unique()):
         "active_flag": "Y"
     })
 
+# Step 6: Construct the granular table column-level schema definitions array
 schema_rows = []
 
+# Loop through individual attribute schema metadata configurations to establish typing specifications
 for _, row in structure_pdf.iterrows():
     schema_rows.append({
         "source_system": "lims7",
@@ -92,14 +118,18 @@ for _, row in structure_pdf.iterrows():
         "is_unique_index": str(row.get("IsUniqueIndex", "N"))
     })
 
+# Step 7: Overwrite and update central configuration metastore tables inside the Spark environment
+# Convert master dataset lists over to Spark DataFrames and serialize them directly as tables
 spark.createDataFrame(dataset_rows) \
     .write.mode("overwrite").option("overwriteSchema", "true") \
     .saveAsTable("cfg_lims_dataset")
 
+# Save table schema metadata configurations
 spark.createDataFrame(schema_rows) \
     .write.mode("overwrite").option("overwriteSchema", "true") \
     .saveAsTable("cfg_lims_table_schema")
 
+# Keep copies of the raw source data sheets unmodified in storage for troubleshooting baselines
 spark.createDataFrame(domain_pdf.astype(str)) \
     .write.mode("overwrite").option("overwriteSchema", "true") \
     .saveAsTable("cfg_lims_domain_raw")
@@ -112,6 +142,8 @@ spark.createDataFrame(row_counts_pdf.astype(str)) \
     .write.mode("overwrite").option("overwriteSchema", "true") \
     .saveAsTable("cfg_lims_rowcounts_raw")
 
+# Step 8: Initialize structural operations metadata tables if they don't exist yet
+# Generate the engine execution log table structure
 spark.sql("""
 CREATE TABLE IF NOT EXISTS ops_pipeline_run_log (
     pipeline_run_id STRING,
@@ -131,6 +163,7 @@ CREATE TABLE IF NOT EXISTS ops_pipeline_run_log (
 )
 """)
 
+# Generate the high-watermark tracking control state table structure
 spark.sql("""
 CREATE TABLE IF NOT EXISTS ops_watermark_control (
     source_system STRING,
@@ -143,6 +176,7 @@ CREATE TABLE IF NOT EXISTS ops_watermark_control (
 )
 """)
 
+# Generate the automated data quality (DQ) assertions reporting log table structure
 spark.sql("""
 CREATE TABLE IF NOT EXISTS ops_dq_result (
     batch_id STRING,

@@ -1,16 +1,24 @@
 import sys
+# Add the custom framework directory to the system path to load shared modules
 sys.path.append("/lakehouse/default/Files/framework")
 
+# Import custom frameworks for normalization and generic utility functions
 from utils import *
 from schema_utils import *
 
+# Import the Databricks Data Generator (dbldatagen) tool to synthesize test rows
 import dbldatagen as dg
 from pyspark.sql.types import *
 from pyspark.sql.functions import *
 
 def string_rule(col_name):
+    """
+    Evaluates naming heuristics on incoming column names to return formatting configurations 
+    or category lists tailored for LIMS (Laboratory Information Management System) domains.
+    """
     c = col_name.lower()
 
+    # Apply strict formatting templates for distinct identifier or specific text columns
     if "email" in c:
         return {"prefix": "user_", "suffix": "@example.com", "width": 8}
     elif "phone" in c or "mobile" in c:
@@ -23,6 +31,8 @@ def string_rule(col_name):
         return {"prefix": "CODE-", "suffix": "", "width": 6}
     elif "id" in c:
         return {"prefix": "ID-", "suffix": "", "width": 8}
+        
+    # Provide explicitly constrained categorical value sets for common LIMS operational statuses
     elif "status" in c:
         return {"values": ["Logged", "Received", "In Testing", "Reviewed", "Approved", "Rejected"]}
     elif "method" in c:
@@ -49,12 +59,20 @@ def string_rule(col_name):
         return {"values": ["Sample received", "Testing completed", "Requires review", "No deviation observed"]}
     elif "name" in c:
         return {"values": ["Amit Sharma", "Neha Singh", "Rahul Mehta", "Priya Nair", "John Mathew"]}
+        
+    # Default fallback properties for any generic unmapped textual fields
     else:
         return {"prefix": "TXT-", "suffix": "", "width": 8}
 
 def apply_unique_string_columns(df, unique_string_columns):
+    """
+    Post-processes mock datasets by replacing temporary placeholders with globally unique, 
+    monotonically sequenced, padded string keys to avoid relational index conflicts.
+    """
+    # Create a dynamic row index sequence starting from 1
     df = df.withColumn("__unique_seq", monotonically_increasing_id() + 1)
 
+    # Concat the specific rule parameters together to transform individual column outputs
     for col_name, rule in unique_string_columns.items():
         df = df.withColumn(
             col_name,
@@ -65,44 +83,56 @@ def apply_unique_string_columns(df, unique_string_columns):
             )
         )
 
+    # Drop the temporary sequence column before exporting the clean data structure
     return df.drop("__unique_seq")
 
+# Read out pipelines to dynamically populate empty staging schemas with volume testing targets
 dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
 
+# Process mock data generation requirements table by table
 for ds in dataset_df.collect():
     source_table = ds["source_table"]
     landing_table = ds["landing_table"]
     watermark_column = ds["watermark_column"]
     sample_row_count = int(ds["sample_row_count"])
 
+    # Safety check: Ensure the dynamic target structure is ready to accept records
     if not table_exists(spark, landing_table):
         print(f"Skipping {landing_table}: table not found")
         continue
 
     print(f"Generating {sample_row_count} rows for {landing_table}")
 
+    # Inspect the current physical schema profile of the empty staging landing table
     schema = spark.table(landing_table).schema
 
+    # Initialize the generator object with targeted limits and randomized distributions
     data_gen = dg.DataGenerator(
         sparkSession=spark,
         rows=sample_row_count,
         random=True
     )
 
+    # Dictionary map to store details of fields requiring unique post-process string conversions
     unique_string_columns = {}
 
+    # Inspect the underlying column types one by one to construct data generation engine specifications
     for field in schema.fields:
         col_name = field.name
         dtype = field.dataType
 
+        # Match and apply customized rules for Text fields
         if isinstance(dtype, StringType):
             rule = string_rule(col_name)
+            # If the rule gives a specific set of choices, populate rows by selecting from that set randomly
             if "values" in rule:
                 data_gen = data_gen.withColumn(col_name, StringType(), values=rule["values"])
+            # Otherwise, use a placeholder token and flag the column for immediate post-processing updates
             else:
                 data_gen = data_gen.withColumn(col_name, StringType(), template="PLACEHOLDER")
                 unique_string_columns[col_name] = rule
 
+        # Assign numeric value distributions across different integer precision standards
         elif isinstance(dtype, IntegerType):
             data_gen = data_gen.withColumn(col_name, IntegerType(), minValue=1, maxValue=100000)
 
@@ -115,6 +145,7 @@ for ds in dataset_df.collect():
         elif isinstance(dtype, ByteType):
             data_gen = data_gen.withColumn(col_name, ByteType(), minValue=1, maxValue=100)
 
+        # Assign fractional numeric value distributions across standard decimal architectures
         elif isinstance(dtype, FloatType):
             data_gen = data_gen.withColumn(col_name, FloatType(), minValue=0, maxValue=1000)
 
@@ -124,18 +155,23 @@ for ds in dataset_df.collect():
         elif isinstance(dtype, DecimalType):
             data_gen = data_gen.withColumn(col_name, DecimalType(dtype.precision, dtype.scale), minValue=1, maxValue=9999)
 
+        # Map logical switches randomly across binary true or false distributions
         elif isinstance(dtype, BooleanType):
             data_gen = data_gen.withColumn(col_name, BooleanType(), values=[True, False])
 
+        # Form bounded historical temporal windows for structured data timelines
         elif isinstance(dtype, DateType):
             data_gen = data_gen.withColumn(col_name, DateType(), begin="2024-01-01", end="2025-12-31")
 
         elif isinstance(dtype, TimestampType):
             data_gen = data_gen.withColumn(col_name, TimestampType(), begin="2024-01-01 00:00:00", end="2025-12-31 23:59:59")
 
+    # Compile the specifications to evaluate and generate the raw foundational mock dataset
     sample_df = data_gen.build()
+    # Inject sequenced identifiers to overwrite placeholder strings
     sample_df = apply_unique_string_columns(sample_df, unique_string_columns)
 
+    # Override: Force structural delta tracking updates to read current system time if needed
     if not is_blank(watermark_column) and watermark_column in sample_df.columns:
         wm_dtype = [f.dataType for f in sample_df.schema.fields if f.name == watermark_column][0]
 
@@ -144,6 +180,7 @@ for ds in dataset_df.collect():
         elif isinstance(wm_dtype, DateType):
             sample_df = sample_df.withColumn(watermark_column, current_date())
 
+    # Write out the generated records to append them directly into the physical target data table
     sample_df.write.mode("append").option("overwriteSchema", "true").saveAsTable(landing_table)
 
     print(f"Landing refreshed: {landing_table}")

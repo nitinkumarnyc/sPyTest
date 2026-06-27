@@ -1,19 +1,25 @@
 import sys
+# Add the custom framework directory to the system path to load common functions
 sys.path.append("/lakehouse/default/Files/framework")
 
+# Import custom frameworks for validation checks and dynamic SQL DDL text conversions
 from utils import *
 from schema_utils import *
 
+# Load previously synthesised framework pipelines and table schema configuration logs
 dataset_df = spark.table("cfg_lims_dataset")
 schema_df = spark.table("cfg_lims_table_schema")
 
+# Safety flag: Set to True if you want to force DROP and RE-CREATE existing target physical tables
 overwrite_existing = False
 
+# Sequentially iterate through active configuration mappings collected onto the driver node
 for ds in dataset_df.filter("active_flag = 'Y'").collect():
     source_table = ds["source_table"]
     landing_table = ds["landing_table"]
     bronze_table = ds["bronze_table"]
 
+    # Pull the exact column blueprint mapping for the current table, ordered sequentially by structural layout position
     cols_df = (
         schema_df
         .filter(f"source_table = '{source_table}'")
@@ -21,28 +27,37 @@ for ds in dataset_df.filter("active_flag = 'Y'").collect():
         .collect()
     )
 
+    # Initialize storage structures to format and deduplicate column declarations
     cols = []
     existing_cols = set()
 
+    # Step through each column definition provided by the configuration data matrix
     for c in cols_df:
         col_name = c["column_name"]
 
+        # Drop columns immediately if their names are completely missing or unassigned
         if is_blank(col_name):
             continue
 
+        # Cleanse bounding spacing padding off raw column labels
         clean_col = col_name.strip()
 
+        # Deduplication check: Ignore repetitive configurations to avoid runtime 'Duplicate Column' syntax errors
         if clean_col.lower() in existing_cols:
             continue
 
+        # Add lowercase name to tracking set and append backtick-escaped column with converted Spark DDL data type
         existing_cols.add(clean_col.lower())
         cols.append(f"`{clean_col}` {spark_type_sql(c['data_type'])}")
 
+    # Safety check: Do not execute a create table statement if no valid attributes are found
     if len(cols) == 0:
         print(f"Skipping {source_table}: no columns found")
         continue
 
+    # Step 1: Manage physical setup of the staging landing area table structures
     if not table_exists(spark, landing_table) or overwrite_existing:
+        # Dynamically compose and execute the raw database generation string
         spark.sql(f"""
         CREATE OR REPLACE TABLE {landing_table} (
             {",".join(cols)}
@@ -52,7 +67,9 @@ for ds in dataset_df.filter("active_flag = 'Y'").collect():
     else:
         print(f"Landing exists, skipped: {landing_table}")
 
+    # Step 2: Manage physical setup of persistent bronze tables with appended management metadata columns
     if not table_exists(spark, bronze_table) or overwrite_existing:
+        # Statically bind operational lineage, auditing tracking, and record validity fields to table structures
         spark.sql(f"""
         CREATE OR REPLACE TABLE {bronze_table} (
             {",".join(cols)},

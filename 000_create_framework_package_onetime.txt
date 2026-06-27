@@ -1,8 +1,11 @@
 import os
 
+# Define the target directory path where the framework utility files will be saved
 framework_path = "/lakehouse/default/Files/framework"
+# Create the directory path if it does not already exist; ignore errors if it does
 os.makedirs(framework_path, exist_ok=True)
 
+# Define the source code string for the utility module ('utils.py')
 utils_code = r'''
 from datetime import datetime
 import uuid
@@ -10,27 +13,52 @@ import re
 from pyspark.sql.functions import *
 
 def normalize_name(value):
+    """
+    Cleanses and standardizes names (e.g., table or system names) by removing 
+    special characters, substituting spaces/symbols with underscores, and lowering case.
+    """
     if value is None:
         return None
     value = str(value).strip()
+    # Replace any character that is not alphanumeric or an underscore with a single underscore
     value = re.sub(r"[^A-Za-z0-9_]", "_", value)
+    # Deduplicate consecutive underscores (e.g., '__' becomes '_')
     value = re.sub(r"_+", "_", value)
     return value.lower().strip("_")
 
 def is_blank(value):
+    """
+    Checks if a configuration value or string is null, empty, or contains a 
+    common database string literal representation of an empty/null state.
+    """
     return value is None or str(value).strip().lower() in ["", "nan", "none", "null"]
 
 def generate_pipeline_run_id():
+    """
+    Generates a unique Universally Unique Identifier (UUID v4) string to 
+    uniquely identify a specific execution instance of the entire pipeline.
+    """
     return str(uuid.uuid4())
 
 def generate_batch_id(source_system, table_name, load_type):
+    """
+    Generates a deterministic audit batch identifier by stitching normalized system 
+    metadata together with an accurate Coordinated Universal Time (UTC) timestamp string.
+    """
     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     return f"{normalize_name(source_system)}_{normalize_name(table_name)}_{normalize_name(load_type)}_{ts}"
 
 def utc_now():
+    """
+    Returns the current system timestamp in standard timezone-neutral Coordinated Universal Time (UTC).
+    """
     return datetime.utcnow()
 
 def table_exists(spark, table_name):
+    """
+    Verifies if a specific Spark SQL table physically exists in the catalog 
+    by attempting a lightweight metadata read, catching exceptions gracefully.
+    """
     try:
         spark.table(table_name)
         return True
@@ -38,12 +66,26 @@ def table_exists(spark, table_name):
         return False
 
 def append_log(spark, table_name, row_dict):
+    """
+    Converts a Python dictionary into a single-row DataFrame and appends it to an audit 
+    table, using schema evolution options to handle new tracking fields automatically.
+    """
     spark.createDataFrame([row_dict]).write.mode("append").option("mergeSchema", "true").saveAsTable(table_name)
 
 def checksum_expr(cols):
+    """
+    Builds a dynamic Spark SQL expression that groups, cleanses, casts to string, 
+    and concatenates a list of columns into a single MD5 hash for change tracking.
+    """
+    # Use || as a standard column delimiter while coalescing null values to empty strings
     return md5(concat_ws("||", *[coalesce(col(c).cast("string"), lit("")) for c in cols]))
 
 def add_bronze_metadata(df, batch_id, pipeline_run_id, source_system, source_table, load_type, watermark_value=None):
+    """
+    Appends audit, lineage, tracking, and checksum metadata columns to an incoming 
+    DataFrame before saving it to the permanent Bronze Lakehouse storage layer.
+    """
+    # Keep track of original operational business columns to limit change hashing strictly to them
     business_cols = df.columns
     return (
         df
@@ -58,15 +100,24 @@ def add_bronze_metadata(df, batch_id, pipeline_run_id, source_system, source_tab
         .withColumn("META_CHECKSUM", checksum_expr(business_cols))
         .withColumn("META_ACTIVE", lit(True))
     )
+
 def resolve_column_case_insensitive(df, column_name):
+    """
+    Finds the exact matching case-sensitive column name from a DataFrame schema
+    using a lowercase lookup dictionary, protecting queries from casing shifts.
+    """
     if is_blank(column_name):
         return None
 
+    # Form a casing lookup map: e.g., {'customer_id': 'Customer_ID'}
     lookup = {c.lower(): c for c in df.columns}
     return lookup.get(str(column_name).strip().lower())
 
-
 def resolve_columns_case_insensitive(df, column_names):
+    """
+    Accepts an array of targeted column names and returns an array containing 
+    their actual, case-resolved structural equivalents from the underlying DataFrame.
+    """
     resolved = []
 
     for c in column_names:
@@ -77,14 +128,21 @@ def resolve_columns_case_insensitive(df, column_names):
     return resolved
 '''
 
+# Define the source code string for the schema transformation utility module ('schema_utils.py')
 schema_code = r'''
 from pyspark.sql.types import *
 
 def sql_to_spark_type(sql_type):
+    """
+    Maps relational database engine string column data types (e.g., SQL Server, MySQL) 
+    directly over to their equivalent native PySpark SQL data type objects.
+    """
     dt = str(sql_type).lower().strip()
 
+    # Text mapping rules
     if dt in ["varchar", "nvarchar", "char", "nchar", "text", "ntext", "uniqueidentifier"]:
         return StringType()
+    # Integer mappings
     elif dt == "int":
         return IntegerType()
     elif dt == "bigint":
@@ -93,22 +151,33 @@ def sql_to_spark_type(sql_type):
         return ShortType()
     elif dt == "tinyint":
         return ByteType()
+    # Boolean mappings
     elif dt == "bit":
         return BooleanType()
+    # Precision decimal mapping definitions
     elif dt in ["decimal", "numeric", "money", "smallmoney"]:
         return DecimalType(38, 10)
+    # Variable precision numeric mappings
     elif dt in ["float", "real"]:
         return DoubleType()
+    # Temporal date mappings
     elif dt == "date":
         return DateType()
+    # Temporal time/timestamp mappings
     elif dt in ["datetime", "datetime2", "smalldatetime", "time"]:
         return TimestampType()
+    # Blob and binary object type mappings
     elif dt in ["binary", "varbinary", "image"]:
         return BinaryType()
+    # Catch-all fallback default
     else:
         return StringType()
 
 def spark_type_sql(data_type):
+    """
+    Accepts an incoming schema definition and converts it into its equivalent uppercase 
+    Spark SQL DDL string identifier (used for generating target table DDL statements).
+    """
     t = sql_to_spark_type(data_type)
 
     if isinstance(t, StringType):
@@ -137,9 +206,11 @@ def spark_type_sql(data_type):
     return "STRING"
 '''
 
+# Open an operational file stream and write out the utility helper file script
 with open("/lakehouse/default/Files/framework/utils.py", "w") as f:
     f.write(utils_code)
 
+# Open an operational file stream and write out the schema conversion file script
 with open("/lakehouse/default/Files/framework/schema_utils.py", "w") as f:
     f.write(schema_code)
 

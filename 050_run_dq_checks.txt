@@ -1,12 +1,16 @@
 import sys
+# Add custom framework directory to system path to import local modules
 sys.path.append("/lakehouse/default/Files/framework")
 
+# Import custom utility helper functions and schema management modules
 from utils import *
 from schema_utils import *
 
+# Import PySpark SQL functions and data types needed for schema definition
 from pyspark.sql.functions import *
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
 
+# Define the explicit schema for the Data Quality (DQ) results log table
 dq_schema = StructType([
     StructField("batch_id", StringType(), True),
     StructField("pipeline_run_id", StringType(), True),
@@ -20,30 +24,45 @@ dq_schema = StructType([
 ])
 
 def write_dq_result(row_dict):
+    """
+    Converts a dictionary row into a PySpark DataFrame using the dq_schema
+    and appends the data quality metrics directly into the 'ops_dq_result' table.
+    """
     spark.createDataFrame([row_dict], schema=dq_schema) \
         .write.mode("append") \
         .saveAsTable("ops_dq_result")
 
 def resolve_column_case_insensitive(df, column_name):
+    """
+    Finds the exact matching case-sensitive column name from a DataFrame.
+    Prevents errors caused by mismatches between metadata config and actual table schemas.
+    """
     if is_blank(column_name):
         return None
 
+    # Map lowercase column names to their actual exact-case names from the DataFrame
     lookup = {c.lower(): c for c in df.columns}
     return lookup.get(str(column_name).strip().lower())
 
+# Load table definitions and metadata configurations from the configuration environment
 schema_df = spark.table("cfg_lims_table_schema")
+# Load the dataset registry, filtering only for active tables that require processing
 dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
 
+# Iterate through every active dataset configuration row fetched from the driver node
 for ds in dataset_df.collect():
     source_table = ds["source_table"]
     bronze_table = ds["bronze_table"]
 
+    # Safety check: Skip processing if the target bronze Delta table does not exist
     if not table_exists(spark, bronze_table):
         print(f"Bronze table not found, skipping DQ for {bronze_table}")
         continue
 
+    # Read the actual target bronze table data
     df = spark.table(bronze_table)
 
+    # Fetch the metadata primary key (PK) configurations for this specific table ordered by position
     pk_rows = (
         schema_df
         .filter(f"source_table = '{source_table}'")
@@ -52,32 +71,41 @@ for ds in dataset_df.collect():
         .collect()
     )
 
+    # Safety check: Skip if no columns are registered as primary keys in metadata
     if len(pk_rows) == 0:
         print(f"No PK defined, skipping DQ for {bronze_table}")
         continue
 
+    # Resolve configuration PK column names against the actual case used in the table
     pk_cols = []
     for r in pk_rows:
         actual_col = resolve_column_case_insensitive(df, r["column_name"])
         if actual_col:
             pk_cols.append(actual_col)
 
+    # Safety check: Skip if the configured PK columns are totally missing from the physical table
     if len(pk_cols) == 0:
         print(f"PK columns not found in actual table, skipping DQ for {bronze_table}")
         continue
 
+    # Extract all distinct batch IDs from the table data to process data incrementally per batch
     batch_ids = [
         r["META_BATCH_ID"]
         for r in df.select("META_BATCH_ID").distinct().collect()
         if r["META_BATCH_ID"] is not None
     ]
 
+    # Process data quality validations isolated per batch
     for batch_id in batch_ids:
+        # Filter dataframe rows belonging exclusively to the current batch loop
         bdf = df.filter(col("META_BATCH_ID") == batch_id)
 
+        # RULE 1: Check for NULL values in Primary Key columns
+        # Dynamically build an OR condition string mapping across all primary key columns
         null_condition = " OR ".join([f"`{c}` IS NULL" for c in pk_cols])
         null_count = bdf.filter(null_condition).count()
 
+        # Log results for the Primary Key Not Null validation check
         write_dq_result({
             "batch_id": batch_id,
             "pipeline_run_id": "NA",
@@ -90,6 +118,8 @@ for ds in dataset_df.collect():
             "created_on": utc_now()
         })
 
+        # RULE 2: Check for Duplicate Records on Primary Keys
+        # Group by all primary keys, count occurrences, and filter for rows appearing more than once
         dup_count = (
             bdf.groupBy(*pk_cols)
             .count()
@@ -97,6 +127,7 @@ for ds in dataset_df.collect():
             .count()
         )
 
+        # Log results for the Primary Key Duplicate validation check
         write_dq_result({
             "batch_id": batch_id,
             "pipeline_run_id": "NA",
@@ -109,6 +140,7 @@ for ds in dataset_df.collect():
             "created_on": utc_now()
         })
 
+        # Print standard log output summarizing the batch run metrics
         print(f"{bronze_table} | {batch_id} | null_pk={null_count}, duplicate_pk={dup_count}")
 
 print("DQ checks completed.")

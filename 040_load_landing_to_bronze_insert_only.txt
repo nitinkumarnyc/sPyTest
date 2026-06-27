@@ -1,15 +1,21 @@
 import sys
+# Add custom framework path to system to import reusable utilities and helpers
 sys.path.append("/lakehouse/default/Files/framework")
 
+# Import custom frameworks for audit logs, schema handling, and generation tools
 from utils import *
 from schema_utils import *
 
+# Import PySpark functions and core types required to design log tables
 from pyspark.sql.functions import *
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
 
+# Set the hardcoded context identity for the source system
 source_system = "lims7"
+# Call custom utility to generate a unique execution ID for this orchestrator run
 pipeline_run_id = generate_pipeline_run_id()
 
+# Define the structured schema for tracking high-watermarks for incremental loading
 watermark_schema = StructType([
     StructField("source_system", StringType(), True),
     StructField("table_name", StringType(), True),
@@ -20,6 +26,7 @@ watermark_schema = StructType([
     StructField("updated_on", TimestampType(), True)
 ])
 
+# Define the structured schema for tracking general framework run statistics
 pipeline_log_schema = StructType([
     StructField("pipeline_run_id", StringType(), True),
     StructField("batch_id", StringType(), True),
@@ -38,16 +45,28 @@ pipeline_log_schema = StructType([
 ])
 
 def write_watermark(row_dict):
+    """
+    Appends high-watermark check records into the control table
+    to remember how much data was successfully processed.
+    """
     spark.createDataFrame([row_dict], schema=watermark_schema) \
         .write.mode("append") \
         .saveAsTable("ops_watermark_control")
 
 def write_pipeline_log(row_dict):
+    """
+    Appends full execution metrics (row counts, duration, status)
+    into the audit trail table for data governance and monitoring.
+    """
     spark.createDataFrame([row_dict], schema=pipeline_log_schema) \
         .write.mode("append") \
         .saveAsTable("ops_pipeline_run_log")
 
 def get_last_successful_watermark(source_system, source_table, watermark_column):
+    """
+    Queries the audit table to pull the absolute highest timestamp/ID processed
+    by the last successful run, ignoring any full truncation loads.
+    """
     wm_df = spark.sql(f"""
         SELECT last_successful_watermark
         FROM ops_watermark_control
@@ -59,25 +78,32 @@ def get_last_successful_watermark(source_system, source_table, watermark_column)
         LIMIT 1
     """)
 
+    # If this table has never run incrementally before, return None
     if wm_df.count() == 0:
         return None
 
+    # Collect and return the single raw value from the first row
     return wm_df.collect()[0]["last_successful_watermark"]
 
+# Load configuration definitions for active data pipelines requiring syncs
 dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
 
+# Loop sequentially through each active configuration metadata row
 for ds in dataset_df.collect():
 
+    # Extract target metadata naming patterns for processing maps
     source_table = ds["source_table"]
     landing_table = ds["landing_table"]
     bronze_table = ds["bronze_table"]
     watermark_column_raw = ds["watermark_column"]
     load_type = ds["load_type"]
 
+    # Rule override: treat 'max' placeholder strings as an instruction to full-load
     if not is_blank(watermark_column_raw) and str(watermark_column_raw).strip().lower().startswith("max"):
         watermark_column_raw = None
         load_type = "truncate_load"
 
+    # Evaluate structural strategies (No column = replace whole table; Column found = delta incremental)
     if is_blank(watermark_column_raw):
         watermark_column_raw = None
         load_type = "truncate_load"
@@ -85,8 +111,10 @@ for ds in dataset_df.collect():
         watermark_column_raw = str(watermark_column_raw).strip()
         load_type = "incremental"
 
+    # Call framework helper to assign an identifier for this table processing slice
     batch_id = generate_batch_id(source_system, source_table, load_type)
 
+    # Initialize monitoring variables to log defaults before executing risk blocks
     start_time = utc_now()
     records_read = 0
     records_written = 0
@@ -97,6 +125,7 @@ for ds in dataset_df.collect():
     watermark_column_actual = None
 
     try:
+        # Print block console banners tracking operational details
         print("--------------------------------------------------")
         print(f"Source Table : {source_table}")
         print(f"Landing Table: {landing_table}")
@@ -105,38 +134,47 @@ for ds in dataset_df.collect():
         print(f"Watermark    : {watermark_column_raw}")
         print(f"Batch ID     : {batch_id}")
 
+        # Safety check: Catch missing landing tables before trying to query them
         if not table_exists(spark, landing_table):
             status = "SKIPPED"
             error_message = f"Landing table not found: {landing_table}"
             print(error_message)
             continue
 
+        # Load the staging area landing table and save input statistics
         df = spark.table(landing_table)
         records_read = df.count()
 
+        # Handle slicing updates for delta transfers
         if load_type == "incremental":
+            # Match the configured tracking column case with the actual table schema
             watermark_column_actual = resolve_column_case_insensitive(df, watermark_column_raw)
 
+            # Crash gracefully if the tracking column isn't inside the source schema
             if watermark_column_actual is None:
                 raise Exception(
                     f"Watermark column '{watermark_column_raw}' not found in {landing_table}. "
                     f"Available columns: {df.columns}"
                 )
 
+            # Search history for previous checkpoints
             last_wm = get_last_successful_watermark(
                 source_system,
                 source_table,
                 watermark_column_actual
             )
 
+            # Slice the current data pull to strictly newer records
             if last_wm is not None:
                 df = df.filter(col(watermark_column_actual) > lit(last_wm))
 
+            # If new records exist, isolate the maximum value to use as the next checkpoint
             if df.count() > 0:
                 watermark_value = df.agg(
                     max(col(watermark_column_actual)).cast("string")
                 ).collect()[0][0]
 
+        # Call framework layer to add core technical fields (batch_id, run_id, timestamps)
         bronze_df = add_bronze_metadata(
             df=df,
             batch_id=batch_id,
@@ -147,13 +185,16 @@ for ds in dataset_df.collect():
             watermark_value=watermark_value
         )
 
+        # Collect data volumes slated for storage commit
         records_written = bronze_df.count()
 
+        # Commit non-empty changes to target table using automatic schema evolution options
         if records_written > 0:
             bronze_df.write.mode("append") \
                 .option("mergeSchema", "true") \
                 .saveAsTable(bronze_table)
 
+        # Update high-watermark rules for successful incremental pipelines
         if load_type == "incremental" and watermark_value is not None:
             write_watermark({
                 "source_system": source_system,
@@ -165,6 +206,7 @@ for ds in dataset_df.collect():
                 "updated_on": utc_now()
             })
 
+        # Set an explicit tracking note for full table swaps 
         elif load_type == "truncate_load":
             write_watermark({
                 "source_system": source_system,
@@ -178,11 +220,13 @@ for ds in dataset_df.collect():
 
         print(f"Completed: {bronze_table}, inserted rows = {records_written}")
 
+    # Trap operational or execution failures, flagging run status
     except Exception as e:
         status = "FAILED"
         error_message = str(e)
         print(f"Failed {source_table}: {error_message}")
 
+    # Guaranteed block execution to write execution telemetry, even if a table fails
     finally:
         write_pipeline_log({
             "pipeline_run_id": pipeline_run_id,
