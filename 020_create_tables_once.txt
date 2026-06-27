@@ -1,5 +1,5 @@
 import sys
-# Add the custom framework directory to the system path to load common functions
+# Add the custom framework directory to the system path to load shared modules
 sys.path.append("/lakehouse/default/Files/framework")
 
 # Import custom frameworks for validation checks and dynamic SQL DDL text conversions
@@ -31,6 +31,10 @@ for ds in dataset_df.filter("active_flag = 'Y'").collect():
     cols = []
     existing_cols = set()
 
+    # NEW METADATA CO-LOADING: Dynamically identify if any column is flagged as a partition key
+    # (Looks for an 'is_partition_key' property inside the configuration schema dataset)
+    partition_cols = []
+
     # Step through each column definition provided by the configuration data matrix
     for c in cols_df:
         col_name = c["column_name"]
@@ -50,26 +54,43 @@ for ds in dataset_df.filter("active_flag = 'Y'").collect():
         existing_cols.add(clean_col.lower())
         cols.append(f"`{clean_col}` {spark_type_sql(c['data_type'])}")
 
+        # NEW PARTITION TRACKING RULE: If flagged as a partition column, cache it for the DDL generator expression
+        if str(c.get("is_partition_key", "")).strip().upper() in ["Y", "YES", "TRUE"]:
+            partition_cols.append(f"`{clean_col}`")
+
     # Safety check: Do not execute a create table statement if no valid attributes are found
     if len(cols) == 0:
         print(f"Skipping {source_table}: no columns found")
         continue
 
+    # NEW DDL RULE ASSEMBLY: Synthesize the 'PARTITIONED BY' SQL clause if partition keys were found in metadata
+    partition_clause = ""
+    if len(partition_cols) > 0:
+        partition_clause = f"USING DELTA PARTITIONED BY ({', '.join(partition_cols)})"
+    else:
+        partition_clause = "USING DELTA"
+
     # Step 1: Manage physical setup of the staging landing area table structures
     if not table_exists(spark, landing_table) or overwrite_existing:
-        # Dynamically compose and execute the raw database generation string
+        # Dynamically compose and execute the raw database generation string (Landing is unpartitioned for faster append speed)
         spark.sql(f"""
         CREATE OR REPLACE TABLE {landing_table} (
             {",".join(cols)}
         )
+        USING DELTA
         """)
         print(f"Created landing: {landing_table}")
+        
+        # NEW AUTOMATIC OPTIMIZATION BLOCK: Run VORDER/OPTIMIZE immediately after physical instantiation
+        print(f"Optimizing layout with VORDER for: {landing_table}")
+        spark.sql(f"OPTIMIZE {landing_table}")
     else:
         print(f"Landing exists, skipped: {landing_table}")
 
     # Step 2: Manage physical setup of persistent bronze tables with appended management metadata columns
     if not table_exists(spark, bronze_table) or overwrite_existing:
         # Statically bind operational lineage, auditing tracking, and record validity fields to table structures
+        # Inject the dynamically determined partition clause directly into the creation blueprint
         spark.sql(f"""
         CREATE OR REPLACE TABLE {bronze_table} (
             {",".join(cols)},
@@ -84,7 +105,14 @@ for ds in dataset_df.filter("active_flag = 'Y'").collect():
             META_CHECKSUM STRING,
             META_ACTIVE BOOLEAN
         )
+        {partition_clause}
         """)
-        print(f"Created bronze: {bronze_table}")
+        print(f"Created bronze: {bronze_table} (Partitioned: {'Yes' if partition_clause != 'USING DELTA' else 'No'})")
+        
+        # NEW AUTOMATIC OPTIMIZATION BLOCK: Apply standard storage layout consolidation and VORDER indexing on Bronze
+        print(f"Optimizing storage layout with VORDER for: {bronze_table}")
+        spark.sql(f"OPTIMIZE {bronze_table}")
     else:
         print(f"Bronze exists, skipped: {bronze_table}")
+
+print("DDL deployment and physical optimization completed successfully.")

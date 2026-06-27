@@ -1,0 +1,7 @@
+Add proper comments to this script 'INLINE' explaining in detail what each part does
+================
+
+introduce NULL value frequencies (e.g., 5% nulls) for nullable fields
+Add parent-child foreign key matching so child tables reference valid generated keys
+
+If you notice your data volumes growing, I can show you how to upgrade this DDL script to automatically partition tables (like partitioning by a timestamp or region column) to optimize read speeds. Would you like to:See how to add Delta Lake table partitioning rules based on metadata configurations?Add an automatic table optimization block (OPTIMIZE / VORDER) after creation?
