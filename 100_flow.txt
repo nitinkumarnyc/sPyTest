@@ -1,0 +1,121 @@
+## Data Flowchart Design Document: LIMS Ingestion Framework
+This document outlines the architecture, execution order, and structured data lineage for the Laboratory Information Management System (LIMS) Lakehouse Ingestion Framework.
+------------------------------
+## ??? Framework Component Overview & Chronological Pipeline Order
+The framework is constructed using six modular PySpark scripts. They execute sequentially to build files, establish catalogs, mock pipeline runs, load data, and run quality validations.
+
+[001_Init] --> [002_Metadata] --> [003_DDL] --> [004_Mock] --> [005_Ingestion] --> [006_Validation]
+
+
+   1. 001_initialization_and_shared_libraries.py
+   * Purpose: Creates the base system directories and generates the framework code files (utils.py and schema_utils.py) containing core helper functions like text normalization, case-insensitive mapping, MD5 checksum evaluation, and metadata injection.
+   2. 002_metadata_and_pipeline_configuration_setup.py
+   * Purpose: Parses external Excel configuration configuration sheets containing database column definitions, active table flags, watermark tracking attributes, and expected rows. Generates and overwrites central control states (cfg_lims_dataset, cfg_lims_table_schema).
+   3. 003_dynamic_table_ddl_deployment.py
+   * Purpose: Evaluates configuration states dynamically, auto-translates relational types into Spark SQL layouts, injects framework operational fields (META_*), applies layout partitioning rules, and executes CREATE OR REPLACE commands alongside Microsoft Fabric VORDER optimizations.
+   4. 004_synthetic_test_data_generator.py
+   * Purpose: Utilizes the dbldatagen library to dynamically generate realistic LIMS sample domains. Features semantic naming heuristic replacements, strict unique identifier progressions, and randomized data distributions.
+   5. 005_landing_to_bronze_lakehouse_ingestion.py
+   * Purpose: Implements incremental high-watermark delta checks or full table truncations. Applies audit metadata lineages, handles column schema drift boundaries safely, writes files out to persistent Delta Lake structures, and preserves run metrics.
+   6. 006_automated_data_quality_validations.py
+   * Purpose: Performs post-ingestion compliance assertion tests on the persistent Bronze storage layers. Dynamically builds complex validation filters to assert PK_NOT_NULL and PK_DUPLICATE_CHECK guidelines, tracking error counts inside log sinks.
+   
+------------------------------
+## ?? Complete Technical Architecture & System Data Flowchart
+The flowchart below visualizes the architectural boundaries, the pipeline progression lanes, and the interactions between raw files, configuration registers, execution layers, and operation metrics.
+
+===========================================================================================================================
+                                        LIMS LAKEHOUSE INGESTION ARCHITECTURE
+===========================================================================================================================
+
+       [ External Config Source ]
+                   ¦
+                   ?
+   +------------------------------+
+   ¦ Excel Configuration Workbook ¦?--------------------------- [ Reads Sheet Blueprints ]
+   +------------------------------+                                         ¦
+                   ¦                                                        ¦
+                   ? (Executes Phase 002)                                   ¦
+   +------------------------------+                                         ¦
+   ¦  cfg_lims_dataset            +---------------------------+             ¦
+   ¦  cfg_lims_table_schema       +-------------+             ¦             ¦
+   +------------------------------+             ¦             ¦             ¦
+                   ¦                            ¦             ¦             ¦
+                   ? (Executes Phase 003)       ¦             ¦             ¦
+   +------------------------------+             ¦             ¦             ¦
+   ¦  Dynamic DDL & Partitioning  ¦             ¦             ¦             ¦
+   +------------------------------+             ¦             ¦             ¦
+                   ¦                            ¦             ¦             ¦
+                   ? (Generates Structures)     ?             ¦             ¦
+   +------------------------------+    +-----------------+    ¦             ¦
+   ¦  lnd_lims_[domain]_[entity]  ¦?---¦ dbldatagen Generator ¦    ¦             ¦
+   +------------------------------+    +-----------------+    ¦             ¦
+                   ¦ (Phase 004 Populates)      ¦             ¦             ¦
+                   ¦                            ?             ¦             ¦
+                   ¦                     [ Heuristic Rules ]  ¦             ¦
+                   ¦                                          ¦             ¦
+                   ? (Executes Phase 005 Ingestion)           ?             ¦
+   +------------------------------+             +------------------------+  ¦
+   ¦   Incremental/Full Engine    ¦?------------¦ ops_watermark_control  +--¦
+   +------------------------------+             +------------------------+  ¦
+                   ¦ (Appends Lineage & META_*)                             ¦
+                   ?                                                        ¦
+   +------------------------------+                                         ¦
+   ¦  brz_lims_[domain]_[entity]  ¦?----------------------------------------+
+   +------------------------------+
+                   ¦
+                   +----------------------------+
+                   ? (Executes Phase 006 Checks)? (Orchestration Logging)
+   +------------------------------+    +------------------------+
+   ¦  Data Quality Audit Assertions¦    ¦  ops_pipeline_run_log  ¦
+   +------------------------------+    +------------------------+
+                   ¦
+                   ?
+   +------------------------------+
+   ¦  ops_dq_result Log Register  ¦
+   +------------------------------+
+
+===========================================================================================================================
+
+------------------------------
+## ?? Comprehensive Shared Meta-Field Reference Lineage
+When data processes through the pipeline and transitions from the transient Ingestion Landing zone into the persistent Bronze Lakehouse, the framework injects ten distinct audit metadata columns using the add_bronze_metadata handler.
+These indicators maintain end-to-end lineage data tracking visibility:
+
+| Injected Metadata Column | Target PySpark Data Type | Operational Purpose & Ingestion Lineage Derivation |
+|---|---|---|
+| META_BATCH_ID | StringType() | Generated via generate_batch_id(). Joins the lowercased system identifier, entity name, and load rule strategy alongside a Coordinated Universal Time (YYYYMMDDHHMMSS) timestamp format. |
+| META_PIPELINE_RUN_ID | StringType() | Generated via generate_pipeline_run_id(). Injects a distinct Universally Unique Identifier (UUID v4) across all entities processed together within an orchestration block execution cycle. |
+| META_SOURCE_SYSTEM | StringType() | Hardcoded context layer identity tracking constant (e.g., "lims7") indicating the source system origin boundaries. |
+| META_SOURCE_TABLE | StringType() | Stores the original case-sensitive un-normalized uppercase database table entity string pulled directly out of the configuration register. |
+| META_LOAD_TYPE | StringType() | Identifies the execution pipeline loading mechanism strategy used. Records either "incremental" or "truncate_load". |
+| META_WATERMARK_VALUE | StringType() | Captures the absolute high-watermark numeric sequence or tracking date extracted via max() functions from the input file subset to baseline sequential delta cuts. |
+| META_CREATED_ON | TimestampType() | Uses PySpark's local current_timestamp() function to record the exact execution runtime moment files were processed into the persistent data Lakehouse. |
+| META_UPDATED_ON | TimestampType() | Tracks administrative update execution records. Initialized identically to META_CREATED_ON during deployment. |
+| META_CHECKSUM | StringType() | Computes a robust MD5 value change identification signature by concatenating business column properties together via a dedicated custom expression: md5(concat_ws("||", *[coalesce(col(c).cast("string"), lit(" ")) for c in cols])). |
+| META_ACTIVE | BooleanType() | Hardcoded logical boolean switch defaulting to True to denote current data row validity states for operational downstream dashboard integrations. |
+
+------------------------------
+## ?? Data Validation and Control Registries
+The framework establishes three main operational auditing and metric tables to maintain process governance and pipeline health:
+## 1. Watermark Control Storage (ops_watermark_control)
+Tracks high-watermark thresholds across active data pipelines:
+
+* Filters out full-load strings (FULL_LOAD_%).
+* Evaluates timestamps using descending order constraints (ORDER BY updated_on DESC LIMIT 1).
+* Retains historical high-watermark boundaries per source system, table name, and specific tracking column.
+
+## 2. Operational Execution Monitoring Logs (ops_pipeline_run_log)
+Guaranteed to execute via finally code runtime safety wrappers. This structure captures total execution telemetry metrics regardless of success or unexpected runtime exceptions:
+
+* Logs run details, including row statistics (records_read, records_written, records_rejected).
+* Monitors start times, end times, and pipeline run status indicators (SUCCESS, SKIPPED, FAILED).
+* Captures raw stack traces directly into error_message string properties for faster debugging.
+
+## 3. Automated Data Quality Log Registry (ops_dq_result)
+Stores structural compliance tracking information generated by assertion engines:
+
+* PK_NOT_NULL Check: Asserts that no key fields contain missing data records by building an automated condition template mapping across table primary keys: OR.join(["c IS NULL"]).
+* PK_DUPLICATE_CHECK Check: Asserts relational record uniqueness across target tables. Groups values across configured primary key columns and flags anomalies where occurrences exceed database limits: .groupBy(*pk_cols).count().filter("count > 1").
+
+
