@@ -1,0 +1,129 @@
+import sys
+# Add the custom framework directory to the system path to load shared modules
+sys.path.append("/lakehouse/default/Files/framework")
+
+# Import custom frameworks for generic utility functions
+from utils import *
+from schema_utils import *
+
+# Import PySpark functions and core tracking types
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+print("Initializing automated post-migration data rollback safeguard check...")
+print("-----------------------------------------------------------------------")
+
+try:
+    # Step 1: Identify the absolute latest validation batch execution ID in the system
+    latest_batch_df = spark.sql("""
+        SELECT max(batch_id) as last_batch 
+        FROM ops_dq_result 
+        WHERE source_system = 'lims7_migration_val'
+    """)
+    
+    # Safety Check: Exit immediately if the validation logging matrix has no history
+    if latest_batch_df.count() == 0 or latest_batch_df.collect()[0]["last_batch"] is None:
+        print("[INFO] No historical migration validation runs discovered. Rollback check skipped.")
+        sys.exit(0)
+        
+    latest_batch_id = latest_batch_df.collect()[0]["last_batch"]
+
+    # Step 2: Query the audit log for any critical validation failures in this batch slice
+    failed_validations_df = spark.sql(f"""
+        SELECT DISTINCT table_name, bronze_table 
+        FROM ops_dq_result 
+        WHERE batch_id = '{latest_batch_id}' 
+          AND rule_status = 'FAIL'
+    """)
+
+    total_failures = failed_validations_df.count()
+
+    # Step 3: Trigger defensive rollbacks only if structural data errors are explicitly discovered
+    if total_failures == 0:
+        print(f"[SAFE] Validation Batch '{latest_batch_id}' passed perfectly. No rollbacks required.")
+        sys.exit(0)
+
+    print(f"?? CRITICAL: Validation Batch '{latest_batch_id}' failed with {total_failures} data discrepancies.")
+    print("Executing automated rollback protocol to restore production storage targets...")
+    print("-----------------------------------------------------------------------")
+
+    # Fetch rows to execute individual recovery functions table-by-table
+    failed_tables_list = failed_validations_df.collect()
+
+    for failed_row in failed_tables_list:
+        source_table_name = failed_row["table_name"]
+        target_bronze_table = failed_row["bronze_table"]
+        legacy_unpartitioned_table = f"old_legacy_{source_table_name.lower()}"
+        
+        print(f"Processing Recovery Loop for Target: {target_bronze_table}")
+
+        # -------------------------------------------------------------------------
+        # GUARD 1: RECOVER PERMANENT BRONZE STORAGE STORAGE LAYER VIA DELTA TIME TRAVEL
+        # -------------------------------------------------------------------------
+        if table_exists(spark, target_bronze_table):
+            try:
+                # Query the Delta Lake transaction history log to pinpoint the exact moment before the migration write
+                # It searches for the newest execution commit right before our migration batch append hit
+                history_df = spark.sql(f"DESCRIBE HISTORY {target_bronze_table}")
+                
+                # Filter out the migration appends to find the latest valid baseline version code
+                pre_migration_commit = history_df.filter(
+                    (~col("operationParameters.mode").isin(["Append"])) & 
+                    (col("operation") != "CREATE TABLE")
+                ).orderBy(col("version").desc()).limit(1).collect()
+
+                if len(pre_migration_commit) > 0:
+                    # Isolate the exact version integer to roll back to [1]
+                    rollback_version = pre_migration_commit[0]["version"]
+                    print(f"   [TIME TRAVEL] Restoring table to pre-migration baseline version: {rollback_version}")
+                    
+                    # Execute native Delta Lake RESTORE command to instantly snap files back to old history [1]
+                    spark.sql(f"RESTORE TABLE {target_bronze_table} TO VERSION AS OF {rollback_version}")
+                else:
+                    # Fallback rule: If the table was brand new, safely TRUNCATE the bad migration records instead
+                    print("   [FALLBACK] No pre-existing history version found. Truncating table data safely.")
+                    spark.sql(f"TRUNCATE TABLE {target_bronze_table}")
+
+                # Re-optimize the physical file distribution layers to finalize the restoration
+                spark.sql(f"OPTIMIZE {target_bronze_table}")
+                print(f"   [SUCCESS] Bronze storage target '{target_bronze_table}' rolled back safely.")
+
+            except Exception as target_restore_err:
+                print(f"   [ERROR] Failed to execute Delta Time Travel restore on {target_bronze_table}: {str(target_restore_err)}")
+
+        # -------------------------------------------------------------------------
+        # GUARD 2: CLEAN UP STAGING LANDING PLACES TO PREVENT INGESTION REPETITIONS
+        # -------------------------------------------------------------------------
+        if table_exists(spark, legacy_unpartitioned_table):
+            try:
+                # Wipe dirty uncommitted files out of the landing target so next runs don't process garbage data
+                print(f"   [CLEANUP] Truncating landing table data area: {legacy_unpartitioned_table}")
+                spark.sql(f"TRUNCATE TABLE {legacy_unpartitioned_table}")
+            except Exception as landing_truncate_err:
+                print(f"   [ERROR] Failed to clean up staging area {legacy_unpartitioned_table}: {str(landing_truncate_err)}")
+
+        # -------------------------------------------------------------------------
+        # GUARD 3: LOG THE ROLLBACK MITIGATION IN THE ENGINE AUDIT LOGS
+        # -------------------------------------------------------------------------
+        append_log(spark, "ops_pipeline_run_log", {
+            "pipeline_run_id": f"ROLLBACK_{latest_batch_id}",
+            "batch_id": latest_batch_id,
+            "source_system": "lims7_rollback_engine",
+            "table_name": source_table_name,
+            "landing_table": legacy_unpartitioned_table,
+            "bronze_table": target_bronze_table,
+            "load_type": "AUTOMATED_SAFETY_ROLLBACK",
+            "start_time": utc_now(),
+            "end_time": utc_now(),
+            "status": "ROLLBACK_COMPLETED",
+            "records_read": 0,
+            "records_written": 0,
+            "records_rejected": 0,
+            "error_message": f"Data anomalies triggered rollback execution for batch: {latest_batch_id}"
+        })
+
+    print("-----------------------------------------------------------------------")
+    print("Automated storage rollback sequence completed. Production targets secured.")
+
+except Exception as rollback_engine_error:
+    print(f"[FATAL ENGINE ERROR] Rollback safeguard execution failed: {str(rollback_engine_error)}")

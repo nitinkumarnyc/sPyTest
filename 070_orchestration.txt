@@ -1,0 +1,248 @@
+import sys
+import os
+
+# Add the custom framework directory to the system path to load shared modules
+sys.path.append("/lakehouse/default/Files/framework")
+
+# Import custom frameworks for generic utility functions and logs
+from utils import *
+from schema_utils import *
+
+# Import PySpark functions and tracking libraries
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+def run_master_orchestration():
+    """
+    Orchestrates the entire migration workflow sequentially:
+    1. Historical Migration Sync
+    2. Post-Migration Data Quality Validation
+    3. Automated Summary Alert Generation
+    4. Rollback execution (Conditional upon validation failures)
+    """
+    print("================================================================================")
+    print("?? STARTING MASTER DATA MIGRATION ORCHESTRATION PIPELINE")
+    print("================================================================================")
+    
+    master_start_time = utc_now()
+    orchestration_status = "SUCCESS"
+    
+    # -------------------------------------------------------------------------
+    # PHASE 1: HISTORICAL DATA MIGRATION SYNC
+    # -------------------------------------------------------------------------
+    print("\n[PHASE 1/4] Executing Automated Data Migration Sync...")
+    print("--------------------------------------------------------------------------------")
+    try:
+        # Load the master configuration registry tracking active pipelines
+        dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
+        migration_pipeline_run_id = generate_pipeline_run_id()
+        source_system_identifier = "lims7_migration"
+
+        for ds in dataset_df.collect():
+            source_table_name = ds["source_table"]
+            target_bronze_table = ds["bronze_table"]
+            legacy_unpartitioned_table = f"old_legacy_{source_table_name.lower()}"
+            migration_batch_id = generate_batch_id(source_system_identifier, source_table_name, "historical_migration")
+            
+            if not table_exists(spark, legacy_unpartitioned_table) or not table_exists(spark, target_bronze_table):
+                continue
+                
+            legacy_df = spark.table(legacy_unpartitioned_table)
+            total_records_read = legacy_df.count()
+            
+            if total_records_read == 0:
+                continue
+                
+            target_schema_fields = spark.table(target_bronze_table).schema.names
+            pure_business_columns = [c for c in target_schema_fields if not c.startswith("META_")]
+            
+            matched_source_columns = []
+            for target_col in pure_business_columns:
+                resolved_name = resolve_column_case_insensitive(legacy_df, target_col)
+                if resolved_name:
+                    matched_source_columns.append(col(resolved_name).alias(target_col))
+                else:
+                    target_type = [f.dataType for f in spark.table(target_bronze_table).schema.fields if f.name == target_col]
+                    matched_source_columns.append(lit(None).cast(target_type).alias(target_col))
+
+            processed_legacy_df = legacy_df.select(*matched_source_columns)
+            migrated_bronze_df = add_bronze_metadata(
+                df=processed_legacy_df, batch_id=migration_batch_id, pipeline_run_id=migration_pipeline_run_id,
+                source_system=source_system_identifier, source_table=source_table_name,
+                load_type="full_historical_migration", watermark_value="HISTORICAL_MIGRATION"
+            )
+
+            migrated_bronze_df.write.mode("append").option("mergeSchema", "true").saveAsTable(target_bronze_table)
+            spark.sql(f"OPTIMIZE {target_bronze_table}")
+            
+            append_log(spark, "ops_pipeline_run_log", {
+                "pipeline_run_id": migration_pipeline_run_id, "batch_id": migration_batch_id,
+                "source_system": source_system_identifier, "table_name": source_table_name,
+                "landing_table": legacy_unpartitioned_table, "bronze_table": target_bronze_table,
+                "load_type": "full_historical_migration", "start_time": master_start_time, "end_time": utc_now(),
+                "status": "SUCCESS", "records_read": total_records_read, "records_written": total_records_read,
+                "records_rejected": 0, "error_message": None
+            })
+        print("?? Phase 1 Complete: All active tables synchronized.")
+    except Exception as e:
+        print(f"? CRITICAL FAILURE IN PHASE 1 (MIGRATION): {str(e)}")
+        sys.exit(1)
+
+    # -------------------------------------------------------------------------
+    # PHASE 2: POST-MIGRATION DATA QUALITY VALIDATION
+    # -------------------------------------------------------------------------
+    print("\n[PHASE 2/4] Executing Data Quality Verification and Checksum Validations...")
+    print("--------------------------------------------------------------------------------")
+    validation_pipeline_run_id = generate_pipeline_run_id()
+    validation_batch_id = f"VAL_{utc_now().strftime('%Y%m%d%H%M%S')}"
+    
+    try:
+        for ds in dataset_df.collect():
+            source_table_name = ds["source_table"]
+            target_bronze_table = ds["bronze_table"]
+            legacy_unpartitioned_table = f"old_legacy_{source_table_name.lower()}"
+            
+            if not table_exists(spark, legacy_unpartitioned_table) or not table_exists(spark, target_bronze_table):
+                continue
+
+            legacy_df = spark.table(legacy_unpartitioned_table)
+            bronze_df = spark.table(target_bronze_table)
+            
+            # Row Count Assertion
+            legacy_count = legacy_df.count()
+            bronze_count = bronze_df.count()
+            count_diff = abs(legacy_count - bronze_count)
+            
+            write_dq_result({
+                "batch_id": validation_batch_id, "pipeline_run_id": validation_pipeline_run_id,
+                "source_system": "lims7_migration_val", "table_name": source_table_name, "bronze_table": target_bronze_table,
+                "rule_name": "MIGRATION_ROW_COUNT_CHECK", "rule_status": "PASS" if count_diff == 0 else "FAIL",
+                "failed_count": count_diff, "created_on": utc_now()
+            })
+
+            # Checksum Integrity Assertion
+            target_schema_fields = bronze_df.schema.names
+            pure_business_columns = [c for c in target_schema_fields if not c.startswith("META_")]
+            
+            matched_source_columns = []
+            for target_col in pure_business_columns:
+                resolved_name = resolve_column_case_insensitive(legacy_df, target_col)
+                if resolved_name:
+                    matched_source_columns.append(col(resolved_name).alias(target_col))
+                else:
+                    target_type = [f.dataType for f in bronze_df.schema.fields if f.name == target_col]
+                    matched_source_columns.append(lit(None).cast(target_type).alias(target_col))
+
+            aligned_legacy_df = legacy_df.select(*matched_source_columns)
+            legacy_with_checksum = aligned_legacy_df.withColumn("ROW_CHECKSUM", checksum_expr(pure_business_columns))
+            bronze_with_checksum = bronze_df.select(*pure_business_columns).withColumn("ROW_CHECKSUM", checksum_expr(pure_business_columns))
+            
+            legacy_checksum_agg = legacy_with_checksum.groupBy("ROW_CHECKSUM").count().withColumnRenamed("count", "legacy_count")
+            bronze_checksum_agg = bronze_with_checksum.groupBy("ROW_CHECKSUM").count().withColumnRenamed("count", "bronze_count")
+            
+            mismatched_count = legacy_checksum_agg.join(bronze_checksum_agg, "ROW_CHECKSUM", "full").filter(
+                (col("legacy_count") != col("bronze_count")) | col("legacy_count").isNull() | col("bronze_count").isNull()
+            ).count()
+            
+            write_dq_result({
+                "batch_id": validation_batch_id, "pipeline_run_id": validation_pipeline_run_id,
+                "source_system": "lims7_migration_val", "table_name": source_table_name, "bronze_table": target_bronze_table,
+                "rule_name": "MIGRATION_DATA_CHECKSUM_CHECK", "rule_status": "PASS" if mismatched_count == 0 else "FAIL",
+                "failed_count": mismatched_count, "created_on": utc_now()
+            })
+        print("?? Phase 2 Complete: Validations recorded successfully.")
+    except Exception as e:
+        print(f"? CRITICAL FAILURE IN PHASE 2 (VALIDATION): {str(e)}")
+        sys.exit(1)
+    # -------------------------------------------------------------------------
+    # PHASE 3: AUTOMATED ALERT GENERATION & RECIPIENT ROUTING
+    # -------------------------------------------------------------------------
+    print("\n[PHASE 3/4] Compiling Summary Metrics and Dispatching Channel Reports...")
+    print("--------------------------------------------------------------------------------")
+    try:
+        dq_results_df = spark.sql(f"""
+            SELECT table_name, rule_name, rule_status, failed_count
+            FROM ops_dq_result WHERE batch_id = '{validation_batch_id}'
+        """).collect()
+
+        has_failures = False
+        report_rows = []
+        for row in dq_results_df:
+            if row["rule_status"] == "FAIL":
+                has_failures = True
+            report_rows.append(f"| {row['table_name'].ljust(25)} | {row['rule_name'].ljust(30)} | {row['rule_status'].ljust(6)} | {str(row['failed_count']).ljust(12)} |")
+
+        report_table = "\n".join(report_rows)
+        print(f"Report Generated for Validation Batch: {validation_batch_id}")
+        print(report_table)
+        print("?? Phase 3 Complete: Notification traces outputted smoothly.")
+    except Exception as e:
+        print(f"?? PHASE 3 WARNING (ALERTING): Could not transmit summary telemetry: {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # PHASE 4: CONDITIONAL FALLBACK SAFETY ROLLBACK
+    # -------------------------------------------------------------------------
+    print("\n[PHASE 4/4] Validating Storage Safeguards and Integrity Rollback Rules...")
+    print("--------------------------------------------------------------------------------")
+    try:
+        if has_failures:
+            print("?? ANOMALIES DETECTED! Initiating automated data rollbacks to guarantee isolation safety...")
+            orchestration_status = "FAILED_BUT_ROLLED_BACK"
+            
+            failed_validations_df = spark.sql(f"""
+                SELECT DISTINCT table_name, bronze_table FROM ops_dq_result 
+                WHERE batch_id = '{validation_batch_id}' AND rule_status = 'FAIL'
+            """)
+
+            for failed_row in failed_validations_df.collect():
+                source_table_name = failed_row["table_name"]
+                target_bronze_table = failed_row["bronze_table"]
+                legacy_unpartitioned_table = f"old_legacy_{source_table_name.lower()}"
+                
+                if table_exists(spark, target_bronze_table):
+                    history_df = spark.sql(f"DESCRIBE HISTORY {target_bronze_table}")
+                    
+                    # Target commits that are not modern migration appends or the table initialization statement
+                    pre_migration_commit = history_df.filter(
+                        (~col("operationParameters.mode").isin(["Append"])) & 
+                        (col("operation") != "CREATE TABLE")
+                    ).orderBy(col("version").desc()).limit(1).collect()
+                    
+                    if len(pre_migration_commit) > 0:
+                        rollback_version = pre_migration_commit[0]["version"]
+                        spark.sql(f"RESTORE TABLE {target_bronze_table} TO VERSION AS OF {rollback_version}")
+                    else:
+                        spark.sql(f"TRUNCATE TABLE {target_bronze_table}")
+                    spark.sql(f"OPTIMIZE {target_bronze_table}")
+                    
+                if table_exists(spark, legacy_unpartitioned_table):
+                    spark.sql(f"TRUNCATE TABLE {legacy_unpartitioned_table}")
+                    
+                append_log(spark, "ops_pipeline_run_log", {
+                    "pipeline_run_id": f"ROLLBACK_{validation_batch_id}", "batch_id": validation_batch_id,
+                    "source_system": "lims7_rollback_engine", "table_name": source_table_name,
+                    "landing_table": legacy_unpartitioned_table, "bronze_table": target_bronze_table,
+                    "load_type": "AUTOMATED_SAFETY_ROLLBACK", "start_time": utc_now(), "end_time": utc_now(),
+                    "status": "ROLLBACK_COMPLETED", "records_read": 0, "records_written": 0, "records_rejected": 0,
+                    "error_message": f"Data anomalies triggered rollback execution for batch: {validation_batch_id}"
+                })
+            print("?? Phase 4 Complete: Defensive rollbacks finalized. Target targets sanitized.")
+        else:
+            print("? SAFE: No data anomalies caught. Storage stability confirmed.")
+            print("?? Phase 4 Complete: Skipped fallback rollback route safely.")
+    except Exception as e:
+        print(f"? CRITICAL FAILURE IN PHASE 4 (ROLLBACK safeguard): {str(e)}")
+        sys.exit(1)
+
+    print("\n================================================================================")
+    print(f"?? MASTER ORCHESTRATION PIPELINE ENDED WITH STATUS: {orchestration_status}")
+    print(f"Total Duration: {str(utc_now() - master_start_time)}")
+    print("================================================================================")
+    
+    # Force failure exit status code if safety rollbacks were engaged
+    if orchestration_status != "SUCCESS":
+        sys.exit(1)
+
+# Main runtime selector to trigger the nested script parts
+if __name__ == "__main__":
+    run_master_orchestration()

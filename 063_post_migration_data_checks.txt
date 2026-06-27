@@ -1,0 +1,125 @@
+import sys
+# Add the custom framework directory to the system path to load shared modules
+sys.path.append("/lakehouse/default/Files/framework")
+
+# Import custom frameworks for validation checks and generic utility functions
+from utils import *
+from schema_utils import *
+
+# Import PySpark functions and core tracking types
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+# Load the master configuration registry tracking your active pipelines
+dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
+
+# Generate unique run details for this validation pass
+validation_pipeline_run_id = generate_pipeline_run_id()
+validation_batch_id = f"VAL_{utc_now().strftime('%Y%m%d%H%M%S')}"
+
+print(f"Starting post-migration data validation pass: {validation_pipeline_run_id}")
+print("-------------------------------------------------------------------------")
+
+# Sequentially loop through each active dataset definition to validate records
+for ds in dataset_df.collect():
+    source_table_name = ds["source_table"]
+    target_bronze_table = ds["bronze_table"]
+    
+    # Establish the naming pattern used for your old legacy unpartitioned tables
+    legacy_unpartitioned_table = f"old_legacy_{source_table_name.lower()}"
+    
+    print(f"Validating Table Pair: {legacy_unpartitioned_table} <---> {target_bronze_table}")
+    
+    # Safety Check: Ensure both physical tables exist in the catalog before running comparisons
+    if not table_exists(spark, legacy_unpartitioned_table) or not table_exists(spark, target_bronze_table):
+        print(f"   [SKIP] One or both tables are missing from the catalog. Skipping verification.")
+        continue
+
+    try:
+        # Load the physical source and target dataframes
+        legacy_df = spark.table(legacy_unpartitioned_table)
+        bronze_df = spark.table(target_bronze_table)
+        
+        # -------------------------------------------------------------------------
+        # ASSERTION 1: ROW COUNT VERIFICATION
+        # -------------------------------------------------------------------------
+        legacy_count = legacy_df.count()
+        bronze_count = bronze_df.count()
+        
+        count_diff = abs(legacy_count - bronze_count)
+        count_status = "PASS" if count_diff == 0 else "FAIL"
+        
+        # Write the Row Count check metrics to your central data quality (DQ) log table
+        write_dq_result({
+            "batch_id": validation_batch_id,
+            "pipeline_run_id": validation_pipeline_run_id,
+            "source_system": "lims7_migration_val",
+            "table_name": source_table_name,
+            "bronze_table": target_bronze_table,
+            "rule_name": "MIGRATION_ROW_COUNT_CHECK",
+            "rule_status": count_status,
+            "failed_count": count_diff,
+            "created_on": utc_now()
+        })
+        print(f"   [ROW COUNT] Legacy: {legacy_count} | Bronze: {bronze_count} ---> Status: {count_status}")
+
+        # -------------------------------------------------------------------------
+        # ASSERTION 2: DATA VALUE CHECKSUM AGGREGATION VERIFICATION
+        # -------------------------------------------------------------------------
+        # Extract targeted business columns (ignoring tracking metadata columns)
+        target_schema_fields = bronze_df.schema.names
+        pure_business_columns = [c for c in target_schema_fields if not c.startswith("META_")]
+        
+        # Map and case-align legacy source column layouts to match target columns
+        matched_source_columns = []
+        for target_col in pure_business_columns:
+            resolved_name = resolve_column_case_insensitive(legacy_df, target_col)
+            if resolved_name:
+                matched_source_columns.append(col(resolved_name).alias(target_col))
+            else:
+                # If a new column did not exist in legacy, inject null to line up the checksum schemas
+                target_type = [f.dataType for f in bronze_df.schema.fields if f.name == target_col][0]
+                matched_source_columns.append(lit(None).cast(target_type).alias(target_col))
+
+        # Re-align the legacy dataset using the matched schemas and generate row checksums
+        aligned_legacy_df = legacy_df.select(*matched_source_columns)
+        legacy_with_checksum = aligned_legacy_df.withColumn("ROW_CHECKSUM", checksum_expr(pure_business_columns))
+        
+        # Isolate the business data from the new bronze table and generate row checksums
+        bronze_with_checksum = bronze_df.select(*pure_business_columns).withColumn("ROW_CHECKSUM", checksum_expr(pure_business_columns))
+        
+        # Aggregate the frequency counts of each individual unique row checksum across both layers
+        legacy_checksum_agg = legacy_with_checksum.groupBy("ROW_CHECKSUM").count().withColumnRenamed("count", "legacy_count")
+        bronze_checksum_agg = bronze_with_checksum.groupBy("ROW_CHECKSUM").count().withColumnRenamed("count", "bronze_count")
+        
+        # Full outer join the aggregations to find mismatched, extra, or modified rows
+        checksum_comparison_df = legacy_checksum_agg.join(bronze_checksum_agg, "ROW_CHECKSUM", "full")
+        
+        # Filter rows where the count frequencies do not match exactly
+        mismatched_rows_df = checksum_comparison_df.filter(
+            (col("legacy_count") != col("bronze_count")) | 
+            col("legacy_count").isNull() | 
+            col("bronze_count").isNull()
+        )
+        
+        mismatched_count = mismatched_rows_df.count()
+        checksum_status = "PASS" if mismatched_count == 0 else "FAIL"
+        
+        # Write the Checksum value check metrics to your central data quality (DQ) log table
+        write_dq_result({
+            "batch_id": validation_batch_id,
+            "pipeline_run_id": validation_pipeline_run_id,
+            "source_system": "lims7_migration_val",
+            "table_name": source_table_name,
+            "bronze_table": target_bronze_table,
+            "rule_name": "MIGRATION_DATA_CHECKSUM_CHECK",
+            "rule_status": checksum_status,
+            "failed_count": mismatched_count,
+            "created_on": utc_now()
+        })
+        print(f"   [DATA INTEGRITY] Mismatched row values detected: {mismatched_count} ---> Status: {checksum_status}\n")
+
+    except Exception as validation_error:
+        print(f"   [ERROR] Validation process failed for table {source_table_name}: {str(validation_error)}\n")
+
+print("Post-migration data validation metrics logged to operations governance database.")

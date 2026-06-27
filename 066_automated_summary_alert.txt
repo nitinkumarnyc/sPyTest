@@ -1,0 +1,131 @@
+import sys
+# Add the custom framework directory to the system path to load shared modules
+sys.path.append("/lakehouse/default/Files/framework")
+
+# Import custom frameworks for generic utility functions
+from utils import *
+from schema_utils import *
+
+# Import PySpark functions and core tracking types
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+
+print("Generating post-migration data quality alert report...")
+print("-------------------------------------------------------")
+
+try:
+    # Step 1: Identify the absolute latest validation batch ID executed in the system
+    latest_batch_df = spark.sql("""
+        SELECT max(batch_id) as last_batch 
+        FROM ops_dq_result 
+        WHERE source_system = 'lims7_migration_val'
+    """)
+    
+    # Safety Check: Exit if the logging architecture has no history of migration runs
+    if latest_batch_df.count() == 0 or latest_batch_df.collect()[0]["last_batch"] is None:
+        print("[INFO] No historical migration validation runs discovered in audit logs.")
+        sys.exit(0)
+        
+    latest_batch_id = latest_batch_df.collect()[0]["last_batch"]
+    print(f"Targeting Metrics Batch Run ID: {latest_batch_id}")
+
+    # Step 2: Fetch and aggregate all operational data quality rules evaluated for this run slice
+    dq_results_df = spark.sql(f"""
+        SELECT 
+            table_name,
+            rule_name,
+            rule_status,
+            failed_count
+        FROM ops_dq_result
+        WHERE batch_id = '{latest_batch_id}'
+        ORDER BY table_name, rule_name
+    """).collect()
+
+    # Step 3: Parse and analyze the results into variables and structural text components
+    has_failures = False
+    report_rows = []
+    
+    # Build text metrics table padding structures manually for clean terminal/email layout alignment
+    for row in dq_results_df:
+        status = row["rule_status"]
+        if status == "FAIL":
+            has_failures = True
+            
+        # Format the line with structured spaces for dashboard readability
+        report_rows.append(
+            f"| {row['table_name'].ljust(25)} | {row['rule_name'].ljust(30)} | {status.ljust(6)} | {str(row['failed_count']).ljust(12)} |"
+        )
+
+    # Combine report structures to generate a clean tabular summary
+    report_table_header = (
+        f"+---------------------------+--------------------------------+--------+--------------+\n"
+        f"| Source Table              | Rule Name                      | Status | Variance/Err |\n"
+        f"+---------------------------+--------------------------------+--------+--------------+\n"
+    )
+    report_table_footer = f"\n+---------------------------+--------------------------------+--------+--------------+"
+    report_body_matrix = "\n".join(report_rows)
+    
+    full_text_report_table = f"{report_table_header}{report_body_matrix}{report_table_footer}"
+
+    # Step 4: Construct the tailored notification payload alert layout based on runtime pass status
+    alert_subject = ""
+    alert_banner = ""
+    
+    if has_failures:
+        alert_subject = f"?? ALERT: Data Migration Discrepancies Discovered - Batch: {latest_batch_id}"
+        alert_banner = (
+            "================================================================================\n"
+            "?? CRITICAL INGESTION ERROR: HISTORICAL MIGRATION DATA MISMATCHES FOUND\n"
+            "================================================================================\n"
+            f"The post-migration validation engine caught row-count or structural checksum\n"
+            f"discrepancies during the automated migration verification batch run.\n\n"
+            f"Batch Reference ID : {latest_batch_id}\n"
+            f"Evaluation Time    : {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+            "Review the summary audit trace logs below to isolate broken pipeline targets:\n"
+        )
+    else:
+        alert_subject = f"? SUCCESS: Data Migration Validations Passed - Batch: {latest_batch_id}"
+        alert_banner = (
+            "================================================================================\n"
+            "?? PIPELINE SUCCESS: HISTORICAL MIGRATION COMPLIANCE CHECKS PASSED\n"
+            "================================================================================\n"
+            f"All structural records migrated smoothly. Target row counts and record level\n"
+            f"MD5 data change hash matrixes align exactly between legacy and optimized tables.\n\n"
+            f"Batch Reference ID : {latest_batch_id}\n"
+            f"Evaluation Time    : {utc_now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+            "Validation Run Trace Log Summary:\n"
+        )
+
+    # Stitch the full alert payload message together
+    final_alert_payload_message = f"{alert_banner}\n{full_text_report_table}\n"
+    
+    # Step 5: Route or output the completed alert report to operations channels
+    print(f"\n[COMPOSED SUBJECT]: {alert_subject}\n")
+    print(final_alert_payload_message)
+    
+    # -------------------------------------------------------------------------
+    # ROUTING INTEGRATION EXAMPLES (Uncomment and populate variables to connect)
+    # -------------------------------------------------------------------------
+    
+    # APPROACH A: Route directly to your team's chat app channel via a webhook URL
+    # import requests
+    # webhook_endpoint_url = "https://your-teams-or-slack-webhook-integration-url"
+    # if has_failures:  # Or remove if block to send successful daily summaries as well
+    #     requests.post(webhook_endpoint_url, json={"text": final_alert_payload_message})
+    #     print("[ROUTE] Alert transmitted to dev-ops chat application hook channel.")
+
+    # APPROACH B: Route directly to your team's inbox using an SMTP Server wrapper
+    # import smtplib
+    # from email.mime.text import MIMEText
+    # msg = MIMEText(final_alert_payload_message)
+    # msg['Subject'] = alert_subject
+    # msg['From'] = 'data-pipeline-alerts@yourcompany.com'
+    # msg['To'] = 'data-engineering-team@yourcompany.com'
+    # with smtplib.SMTP('://yourserver.com', 587) as smtp_server:
+    #     smtp_server.starttls()
+    #     smtp_server.login('user', 'password')
+    #     smtp_server.send_message(msg)
+    #     print("[ROUTE] Alert email transmitted to Data Engineering inbox.")
+
+except Exception as report_generation_error:
+    print(f"[ERROR] Failed to compile automated alert summary report: {str(report_generation_error)}")
