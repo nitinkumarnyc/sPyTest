@@ -1,0 +1,149 @@
+import sys
+sys.path.append("/lakehouse/default/Files/framework")
+
+from utils import *
+from schema_utils import *
+
+import dbldatagen as dg
+from pyspark.sql.types import *
+from pyspark.sql.functions import *
+
+def string_rule(col_name):
+    c = col_name.lower()
+
+    if "email" in c:
+        return {"prefix": "user_", "suffix": "@example.com", "width": 8}
+    elif "phone" in c or "mobile" in c:
+        return {"prefix": "+91-9", "suffix": "", "width": 9}
+    elif "sample" in c:
+        return {"prefix": "SMP-", "suffix": "", "width": 8}
+    elif "batch" in c or "lot" in c:
+        return {"prefix": "BAT-", "suffix": "", "width": 6}
+    elif "code" in c:
+        return {"prefix": "CODE-", "suffix": "", "width": 6}
+    elif "id" in c:
+        return {"prefix": "ID-", "suffix": "", "width": 8}
+    elif "status" in c:
+        return {"values": ["Logged", "Received", "In Testing", "Reviewed", "Approved", "Rejected"]}
+    elif "method" in c:
+        return {"values": ["HPLC", "GC", "UV", "FTIR", "Karl Fischer", "Titration"]}
+    elif "instrument" in c:
+        return {"values": ["HPLC-001", "GC-002", "UV-003", "BAL-004", "KF-005"]}
+    elif "department" in c or "dept" in c:
+        return {"values": ["QC", "QA", "Microbiology", "Stability", "Production"]}
+    elif "type" in c:
+        return {"values": ["Raw Material", "Finished Product", "Stability", "Water", "Environmental"]}
+    elif "category" in c:
+        return {"values": ["Chemistry", "Microbiology", "Stability", "Raw Material", "Finished Product"]}
+    elif "priority" in c:
+        return {"values": ["Low", "Normal", "High", "Critical"]}
+    elif "result" in c:
+        return {"values": ["Pass", "Fail", "Within Limit", "Out of Specification", "Not Tested"]}
+    elif "unit" in c:
+        return {"values": ["mg", "g", "kg", "ml", "L", "ppm", "%"]}
+    elif "city" in c:
+        return {"values": ["Mumbai", "Delhi", "Bengaluru", "Hyderabad", "Chennai", "Pune"]}
+    elif "country" in c:
+        return {"values": ["India", "USA", "UK", "Germany", "Singapore"]}
+    elif "remarks" in c or "comment" in c or "description" in c:
+        return {"values": ["Sample received", "Testing completed", "Requires review", "No deviation observed"]}
+    elif "name" in c:
+        return {"values": ["Amit Sharma", "Neha Singh", "Rahul Mehta", "Priya Nair", "John Mathew"]}
+    else:
+        return {"prefix": "TXT-", "suffix": "", "width": 8}
+
+def apply_unique_string_columns(df, unique_string_columns):
+    df = df.withColumn("__unique_seq", monotonically_increasing_id() + 1)
+
+    for col_name, rule in unique_string_columns.items():
+        df = df.withColumn(
+            col_name,
+            concat(
+                lit(rule["prefix"]),
+                lpad(col("__unique_seq").cast("string"), rule["width"], "0"),
+                lit(rule["suffix"])
+            )
+        )
+
+    return df.drop("__unique_seq")
+
+dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
+
+for ds in dataset_df.collect():
+    source_table = ds["source_table"]
+    landing_table = ds["landing_table"]
+    watermark_column = ds["watermark_column"]
+    sample_row_count = int(ds["sample_row_count"])
+
+    if not table_exists(spark, landing_table):
+        print(f"Skipping {landing_table}: table not found")
+        continue
+
+    print(f"Generating {sample_row_count} rows for {landing_table}")
+
+    schema = spark.table(landing_table).schema
+
+    data_gen = dg.DataGenerator(
+        sparkSession=spark,
+        rows=sample_row_count,
+        random=True
+    )
+
+    unique_string_columns = {}
+
+    for field in schema.fields:
+        col_name = field.name
+        dtype = field.dataType
+
+        if isinstance(dtype, StringType):
+            rule = string_rule(col_name)
+            if "values" in rule:
+                data_gen = data_gen.withColumn(col_name, StringType(), values=rule["values"])
+            else:
+                data_gen = data_gen.withColumn(col_name, StringType(), template="PLACEHOLDER")
+                unique_string_columns[col_name] = rule
+
+        elif isinstance(dtype, IntegerType):
+            data_gen = data_gen.withColumn(col_name, IntegerType(), minValue=1, maxValue=100000)
+
+        elif isinstance(dtype, LongType):
+            data_gen = data_gen.withColumn(col_name, LongType(), minValue=1, maxValue=1000000)
+
+        elif isinstance(dtype, ShortType):
+            data_gen = data_gen.withColumn(col_name, ShortType(), minValue=1, maxValue=1000)
+
+        elif isinstance(dtype, ByteType):
+            data_gen = data_gen.withColumn(col_name, ByteType(), minValue=1, maxValue=100)
+
+        elif isinstance(dtype, FloatType):
+            data_gen = data_gen.withColumn(col_name, FloatType(), minValue=0, maxValue=1000)
+
+        elif isinstance(dtype, DoubleType):
+            data_gen = data_gen.withColumn(col_name, DoubleType(), minValue=0, maxValue=1000)
+
+        elif isinstance(dtype, DecimalType):
+            data_gen = data_gen.withColumn(col_name, DecimalType(dtype.precision, dtype.scale), minValue=1, maxValue=9999)
+
+        elif isinstance(dtype, BooleanType):
+            data_gen = data_gen.withColumn(col_name, BooleanType(), values=[True, False])
+
+        elif isinstance(dtype, DateType):
+            data_gen = data_gen.withColumn(col_name, DateType(), begin="2024-01-01", end="2025-12-31")
+
+        elif isinstance(dtype, TimestampType):
+            data_gen = data_gen.withColumn(col_name, TimestampType(), begin="2024-01-01 00:00:00", end="2025-12-31 23:59:59")
+
+    sample_df = data_gen.build()
+    sample_df = apply_unique_string_columns(sample_df, unique_string_columns)
+
+    if not is_blank(watermark_column) and watermark_column in sample_df.columns:
+        wm_dtype = [f.dataType for f in sample_df.schema.fields if f.name == watermark_column][0]
+
+        if isinstance(wm_dtype, TimestampType):
+            sample_df = sample_df.withColumn(watermark_column, current_timestamp())
+        elif isinstance(wm_dtype, DateType):
+            sample_df = sample_df.withColumn(watermark_column, current_date())
+
+    sample_df.write.mode("append").option("overwriteSchema", "true").saveAsTable(landing_table)
+
+    print(f"Landing refreshed: {landing_table}")

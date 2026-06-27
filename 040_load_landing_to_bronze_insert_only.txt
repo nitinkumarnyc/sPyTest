@@ -1,0 +1,204 @@
+import sys
+sys.path.append("/lakehouse/default/Files/framework")
+
+from utils import *
+from schema_utils import *
+
+from pyspark.sql.functions import *
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
+
+source_system = "lims7"
+pipeline_run_id = generate_pipeline_run_id()
+
+watermark_schema = StructType([
+    StructField("source_system", StringType(), True),
+    StructField("table_name", StringType(), True),
+    StructField("watermark_column", StringType(), True),
+    StructField("last_successful_watermark", StringType(), True),
+    StructField("last_batch_id", StringType(), True),
+    StructField("last_pipeline_run_id", StringType(), True),
+    StructField("updated_on", TimestampType(), True)
+])
+
+pipeline_log_schema = StructType([
+    StructField("pipeline_run_id", StringType(), True),
+    StructField("batch_id", StringType(), True),
+    StructField("source_system", StringType(), True),
+    StructField("table_name", StringType(), True),
+    StructField("landing_table", StringType(), True),
+    StructField("bronze_table", StringType(), True),
+    StructField("load_type", StringType(), True),
+    StructField("start_time", TimestampType(), True),
+    StructField("end_time", TimestampType(), True),
+    StructField("status", StringType(), True),
+    StructField("records_read", LongType(), True),
+    StructField("records_written", LongType(), True),
+    StructField("records_rejected", LongType(), True),
+    StructField("error_message", StringType(), True)
+])
+
+def write_watermark(row_dict):
+    spark.createDataFrame([row_dict], schema=watermark_schema) \
+        .write.mode("append") \
+        .saveAsTable("ops_watermark_control")
+
+def write_pipeline_log(row_dict):
+    spark.createDataFrame([row_dict], schema=pipeline_log_schema) \
+        .write.mode("append") \
+        .saveAsTable("ops_pipeline_run_log")
+
+def get_last_successful_watermark(source_system, source_table, watermark_column):
+    wm_df = spark.sql(f"""
+        SELECT last_successful_watermark
+        FROM ops_watermark_control
+        WHERE lower(source_system) = lower('{source_system}')
+          AND lower(table_name) = lower('{source_table}')
+          AND lower(watermark_column) = lower('{watermark_column}')
+          AND last_successful_watermark NOT LIKE 'FULL_LOAD_%'
+        ORDER BY updated_on DESC
+        LIMIT 1
+    """)
+
+    if wm_df.count() == 0:
+        return None
+
+    return wm_df.collect()[0]["last_successful_watermark"]
+
+dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
+
+for ds in dataset_df.collect():
+
+    source_table = ds["source_table"]
+    landing_table = ds["landing_table"]
+    bronze_table = ds["bronze_table"]
+    watermark_column_raw = ds["watermark_column"]
+    load_type = ds["load_type"]
+
+    if not is_blank(watermark_column_raw) and str(watermark_column_raw).strip().lower().startswith("max"):
+        watermark_column_raw = None
+        load_type = "truncate_load"
+
+    if is_blank(watermark_column_raw):
+        watermark_column_raw = None
+        load_type = "truncate_load"
+    else:
+        watermark_column_raw = str(watermark_column_raw).strip()
+        load_type = "incremental"
+
+    batch_id = generate_batch_id(source_system, source_table, load_type)
+
+    start_time = utc_now()
+    records_read = 0
+    records_written = 0
+    records_rejected = 0
+    status = "SUCCESS"
+    error_message = None
+    watermark_value = None
+    watermark_column_actual = None
+
+    try:
+        print("--------------------------------------------------")
+        print(f"Source Table : {source_table}")
+        print(f"Landing Table: {landing_table}")
+        print(f"Bronze Table : {bronze_table}")
+        print(f"Load Type    : {load_type}")
+        print(f"Watermark    : {watermark_column_raw}")
+        print(f"Batch ID     : {batch_id}")
+
+        if not table_exists(spark, landing_table):
+            status = "SKIPPED"
+            error_message = f"Landing table not found: {landing_table}"
+            print(error_message)
+            continue
+
+        df = spark.table(landing_table)
+        records_read = df.count()
+
+        if load_type == "incremental":
+            watermark_column_actual = resolve_column_case_insensitive(df, watermark_column_raw)
+
+            if watermark_column_actual is None:
+                raise Exception(
+                    f"Watermark column '{watermark_column_raw}' not found in {landing_table}. "
+                    f"Available columns: {df.columns}"
+                )
+
+            last_wm = get_last_successful_watermark(
+                source_system,
+                source_table,
+                watermark_column_actual
+            )
+
+            if last_wm is not None:
+                df = df.filter(col(watermark_column_actual) > lit(last_wm))
+
+            if df.count() > 0:
+                watermark_value = df.agg(
+                    max(col(watermark_column_actual)).cast("string")
+                ).collect()[0][0]
+
+        bronze_df = add_bronze_metadata(
+            df=df,
+            batch_id=batch_id,
+            pipeline_run_id=pipeline_run_id,
+            source_system=source_system,
+            source_table=source_table,
+            load_type=load_type,
+            watermark_value=watermark_value
+        )
+
+        records_written = bronze_df.count()
+
+        if records_written > 0:
+            bronze_df.write.mode("append") \
+                .option("mergeSchema", "true") \
+                .saveAsTable(bronze_table)
+
+        if load_type == "incremental" and watermark_value is not None:
+            write_watermark({
+                "source_system": source_system,
+                "table_name": source_table,
+                "watermark_column": watermark_column_actual,
+                "last_successful_watermark": str(watermark_value),
+                "last_batch_id": batch_id,
+                "last_pipeline_run_id": pipeline_run_id,
+                "updated_on": utc_now()
+            })
+
+        elif load_type == "truncate_load":
+            write_watermark({
+                "source_system": source_system,
+                "table_name": source_table,
+                "watermark_column": None,
+                "last_successful_watermark": f"FULL_LOAD_{utc_now().strftime('%Y%m%d%H%M%S')}",
+                "last_batch_id": batch_id,
+                "last_pipeline_run_id": pipeline_run_id,
+                "updated_on": utc_now()
+            })
+
+        print(f"Completed: {bronze_table}, inserted rows = {records_written}")
+
+    except Exception as e:
+        status = "FAILED"
+        error_message = str(e)
+        print(f"Failed {source_table}: {error_message}")
+
+    finally:
+        write_pipeline_log({
+            "pipeline_run_id": pipeline_run_id,
+            "batch_id": batch_id,
+            "source_system": source_system,
+            "table_name": source_table,
+            "landing_table": landing_table,
+            "bronze_table": bronze_table,
+            "load_type": load_type,
+            "start_time": start_time,
+            "end_time": utc_now(),
+            "status": status,
+            "records_read": records_read,
+            "records_written": records_written,
+            "records_rejected": records_rejected,
+            "error_message": error_message
+        })
+
+print("Landing to Bronze load completed.")

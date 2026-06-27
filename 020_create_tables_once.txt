@@ -1,0 +1,73 @@
+import sys
+sys.path.append("/lakehouse/default/Files/framework")
+
+from utils import *
+from schema_utils import *
+
+dataset_df = spark.table("cfg_lims_dataset")
+schema_df = spark.table("cfg_lims_table_schema")
+
+overwrite_existing = False
+
+for ds in dataset_df.filter("active_flag = 'Y'").collect():
+    source_table = ds["source_table"]
+    landing_table = ds["landing_table"]
+    bronze_table = ds["bronze_table"]
+
+    cols_df = (
+        schema_df
+        .filter(f"source_table = '{source_table}'")
+        .orderBy("column_id")
+        .collect()
+    )
+
+    cols = []
+    existing_cols = set()
+
+    for c in cols_df:
+        col_name = c["column_name"]
+
+        if is_blank(col_name):
+            continue
+
+        clean_col = col_name.strip()
+
+        if clean_col.lower() in existing_cols:
+            continue
+
+        existing_cols.add(clean_col.lower())
+        cols.append(f"`{clean_col}` {spark_type_sql(c['data_type'])}")
+
+    if len(cols) == 0:
+        print(f"Skipping {source_table}: no columns found")
+        continue
+
+    if not table_exists(spark, landing_table) or overwrite_existing:
+        spark.sql(f"""
+        CREATE OR REPLACE TABLE {landing_table} (
+            {",".join(cols)}
+        )
+        """)
+        print(f"Created landing: {landing_table}")
+    else:
+        print(f"Landing exists, skipped: {landing_table}")
+
+    if not table_exists(spark, bronze_table) or overwrite_existing:
+        spark.sql(f"""
+        CREATE OR REPLACE TABLE {bronze_table} (
+            {",".join(cols)},
+            META_BATCH_ID STRING,
+            META_PIPELINE_RUN_ID STRING,
+            META_SOURCE_SYSTEM STRING,
+            META_SOURCE_TABLE STRING,
+            META_LOAD_TYPE STRING,
+            META_WATERMARK_VALUE STRING,
+            META_CREATED_ON TIMESTAMP,
+            META_UPDATED_ON TIMESTAMP,
+            META_CHECKSUM STRING,
+            META_ACTIVE BOOLEAN
+        )
+        """)
+        print(f"Created bronze: {bronze_table}")
+    else:
+        print(f"Bronze exists, skipped: {bronze_table}")

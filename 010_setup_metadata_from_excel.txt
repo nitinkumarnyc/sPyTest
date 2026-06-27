@@ -1,0 +1,160 @@
+import sys
+sys.path.append("/lakehouse/default/Files/framework")
+
+from utils import *
+from schema_utils import *
+
+import pandas as pd
+import math
+import builtins
+
+excel_path = "abfss://ws_dataplatform_dev_dataengg@onelake.dfs.fabric.microsoft.com/lkh_adnan.Lakehouse/Files/LIMS_Config/LIMS_Table_Sturcture_and_Data_Domain_Incremental_Columns_Rowcounts.xlsx"
+
+structure_pdf = pd.read_excel(excel_path, sheet_name="LIMS Table Sturcture")
+domain_pdf = pd.read_excel(excel_path, sheet_name="Domain_Categorization")
+incremental_pdf = pd.read_excel(excel_path, sheet_name="Incremental column")
+row_counts_pdf = pd.read_excel(excel_path, sheet_name="RowCounts")
+
+for pdf in [structure_pdf, domain_pdf, incremental_pdf, row_counts_pdf]:
+    pdf.columns = [str(c).strip() for c in pdf.columns]
+
+structure_pdf = structure_pdf.dropna(subset=["Table_Name", "ColumnName", "DataType"])
+structure_pdf["Table_Name"] = structure_pdf["Table_Name"].astype(str).str.strip().str.upper()
+structure_pdf["ColumnName"] = structure_pdf["ColumnName"].astype(str).str.strip()
+structure_pdf["column_id"] = structure_pdf["column_id"].astype(int)
+
+table_domain_map = {}
+
+for _, row in domain_pdf.iterrows():
+    domain = normalize_name(row["Domain"])
+    tables = str(row["Tables"]).split(",")
+
+    for table in tables:
+        table_domain_map[str(table).strip().upper()] = domain
+
+watermark_map = {}
+
+for _, row in incremental_pdf.iterrows():
+    table_name = str(row["Table_Name"]).strip().upper()
+    watermark_col = row["watermark_coloum"]
+
+    if not is_blank(watermark_col):
+        watermark_map[table_name] = str(watermark_col).strip()
+
+row_count_map = {}
+
+for _, row in row_counts_pdf.iterrows():
+    if not is_blank(row["Table_Name"]) and not is_blank(row["Row_Count"]):
+        row_count_map[str(row["Table_Name"]).strip().upper()] = int(row["Row_Count"])
+
+dataset_rows = []
+
+for source_table in sorted(structure_pdf["Table_Name"].unique()):
+    domain = table_domain_map.get(source_table, "general")
+    entity = normalize_name(source_table)
+
+    landing_table = f"lnd_lims_{domain}_{entity}"
+    bronze_table = f"brz_lims_{domain}_{entity}"
+
+    watermark_column = watermark_map.get(source_table)
+    load_type = "incremental" if watermark_column else "truncate_load"
+
+    source_count = row_count_map.get(source_table, 100)
+    sample_count = builtins.max(1, math.ceil(source_count * 0.01))
+
+    dataset_rows.append({
+        "source_system": "lims7",
+        "source_table": source_table,
+        "source_table_norm": entity,
+        "domain": domain,
+        "landing_table": landing_table,
+        "bronze_table": bronze_table,
+        "watermark_column": watermark_column,
+        "load_type": load_type,
+        "source_row_count": source_count,
+        "sample_row_count": sample_count,
+        "active_flag": "Y"
+    })
+
+schema_rows = []
+
+for _, row in structure_pdf.iterrows():
+    schema_rows.append({
+        "source_system": "lims7",
+        "source_table": row["Table_Name"],
+        "source_table_norm": normalize_name(row["Table_Name"]),
+        "column_id": int(row["column_id"]),
+        "column_name": row["ColumnName"],
+        "data_type": row["DataType"],
+        "max_length": str(row.get("max_length", "")),
+        "is_nullable": str(row.get("is_nullable", "")),
+        "is_primary_key": str(row.get("IsPrimaryKey", "N")),
+        "is_unique_index": str(row.get("IsUniqueIndex", "N"))
+    })
+
+spark.createDataFrame(dataset_rows) \
+    .write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable("cfg_lims_dataset")
+
+spark.createDataFrame(schema_rows) \
+    .write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable("cfg_lims_table_schema")
+
+spark.createDataFrame(domain_pdf.astype(str)) \
+    .write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable("cfg_lims_domain_raw")
+
+spark.createDataFrame(incremental_pdf.astype(str)) \
+    .write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable("cfg_lims_incremental_raw")
+
+spark.createDataFrame(row_counts_pdf.astype(str)) \
+    .write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable("cfg_lims_rowcounts_raw")
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS ops_pipeline_run_log (
+    pipeline_run_id STRING,
+    batch_id STRING,
+    source_system STRING,
+    table_name STRING,
+    landing_table STRING,
+    bronze_table STRING,
+    load_type STRING,
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    status STRING,
+    records_read LONG,
+    records_written LONG,
+    records_rejected LONG,
+    error_message STRING
+)
+""")
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS ops_watermark_control (
+    source_system STRING,
+    table_name STRING,
+    watermark_column STRING,
+    last_successful_watermark STRING,
+    last_batch_id STRING,
+    last_pipeline_run_id STRING,
+    updated_on TIMESTAMP
+)
+""")
+
+spark.sql("""
+CREATE TABLE IF NOT EXISTS ops_dq_result (
+    batch_id STRING,
+    pipeline_run_id STRING,
+    source_system STRING,
+    table_name STRING,
+    bronze_table STRING,
+    rule_name STRING,
+    rule_status STRING,
+    failed_count LONG,
+    created_on TIMESTAMP
+)
+""")
+
+print("Metadata setup completed.")

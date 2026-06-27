@@ -1,0 +1,146 @@
+import os
+
+framework_path = "/lakehouse/default/Files/framework"
+os.makedirs(framework_path, exist_ok=True)
+
+utils_code = r'''
+from datetime import datetime
+import uuid
+import re
+from pyspark.sql.functions import *
+
+def normalize_name(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    value = re.sub(r"[^A-Za-z0-9_]", "_", value)
+    value = re.sub(r"_+", "_", value)
+    return value.lower().strip("_")
+
+def is_blank(value):
+    return value is None or str(value).strip().lower() in ["", "nan", "none", "null"]
+
+def generate_pipeline_run_id():
+    return str(uuid.uuid4())
+
+def generate_batch_id(source_system, table_name, load_type):
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return f"{normalize_name(source_system)}_{normalize_name(table_name)}_{normalize_name(load_type)}_{ts}"
+
+def utc_now():
+    return datetime.utcnow()
+
+def table_exists(spark, table_name):
+    try:
+        spark.table(table_name)
+        return True
+    except:
+        return False
+
+def append_log(spark, table_name, row_dict):
+    spark.createDataFrame([row_dict]).write.mode("append").option("mergeSchema", "true").saveAsTable(table_name)
+
+def checksum_expr(cols):
+    return md5(concat_ws("||", *[coalesce(col(c).cast("string"), lit("")) for c in cols]))
+
+def add_bronze_metadata(df, batch_id, pipeline_run_id, source_system, source_table, load_type, watermark_value=None):
+    business_cols = df.columns
+    return (
+        df
+        .withColumn("META_BATCH_ID", lit(batch_id))
+        .withColumn("META_PIPELINE_RUN_ID", lit(pipeline_run_id))
+        .withColumn("META_SOURCE_SYSTEM", lit(source_system))
+        .withColumn("META_SOURCE_TABLE", lit(source_table))
+        .withColumn("META_LOAD_TYPE", lit(load_type))
+        .withColumn("META_WATERMARK_VALUE", lit(watermark_value))
+        .withColumn("META_CREATED_ON", current_timestamp())
+        .withColumn("META_UPDATED_ON", current_timestamp())
+        .withColumn("META_CHECKSUM", checksum_expr(business_cols))
+        .withColumn("META_ACTIVE", lit(True))
+    )
+def resolve_column_case_insensitive(df, column_name):
+    if is_blank(column_name):
+        return None
+
+    lookup = {c.lower(): c for c in df.columns}
+    return lookup.get(str(column_name).strip().lower())
+
+
+def resolve_columns_case_insensitive(df, column_names):
+    resolved = []
+
+    for c in column_names:
+        actual_col = resolve_column_case_insensitive(df, c)
+        if actual_col is not None:
+            resolved.append(actual_col)
+
+    return resolved
+'''
+
+schema_code = r'''
+from pyspark.sql.types import *
+
+def sql_to_spark_type(sql_type):
+    dt = str(sql_type).lower().strip()
+
+    if dt in ["varchar", "nvarchar", "char", "nchar", "text", "ntext", "uniqueidentifier"]:
+        return StringType()
+    elif dt == "int":
+        return IntegerType()
+    elif dt == "bigint":
+        return LongType()
+    elif dt == "smallint":
+        return ShortType()
+    elif dt == "tinyint":
+        return ByteType()
+    elif dt == "bit":
+        return BooleanType()
+    elif dt in ["decimal", "numeric", "money", "smallmoney"]:
+        return DecimalType(38, 10)
+    elif dt in ["float", "real"]:
+        return DoubleType()
+    elif dt == "date":
+        return DateType()
+    elif dt in ["datetime", "datetime2", "smalldatetime", "time"]:
+        return TimestampType()
+    elif dt in ["binary", "varbinary", "image"]:
+        return BinaryType()
+    else:
+        return StringType()
+
+def spark_type_sql(data_type):
+    t = sql_to_spark_type(data_type)
+
+    if isinstance(t, StringType):
+        return "STRING"
+    if isinstance(t, IntegerType):
+        return "INT"
+    if isinstance(t, LongType):
+        return "BIGINT"
+    if isinstance(t, ShortType):
+        return "SMALLINT"
+    if isinstance(t, ByteType):
+        return "TINYINT"
+    if isinstance(t, BooleanType):
+        return "BOOLEAN"
+    if isinstance(t, DecimalType):
+        return "DECIMAL(38,10)"
+    if isinstance(t, DoubleType):
+        return "DOUBLE"
+    if isinstance(t, DateType):
+        return "DATE"
+    if isinstance(t, TimestampType):
+        return "TIMESTAMP"
+    if isinstance(t, BinaryType):
+        return "BINARY"
+
+    return "STRING"
+'''
+
+with open("/lakehouse/default/Files/framework/utils.py", "w") as f:
+    f.write(utils_code)
+
+with open("/lakehouse/default/Files/framework/schema_utils.py", "w") as f:
+    f.write(schema_code)
+
+print("Framework package created.")

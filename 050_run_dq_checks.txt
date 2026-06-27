@@ -1,0 +1,114 @@
+import sys
+sys.path.append("/lakehouse/default/Files/framework")
+
+from utils import *
+from schema_utils import *
+
+from pyspark.sql.functions import *
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
+
+dq_schema = StructType([
+    StructField("batch_id", StringType(), True),
+    StructField("pipeline_run_id", StringType(), True),
+    StructField("source_system", StringType(), True),
+    StructField("table_name", StringType(), True),
+    StructField("bronze_table", StringType(), True),
+    StructField("rule_name", StringType(), True),
+    StructField("rule_status", StringType(), True),
+    StructField("failed_count", LongType(), True),
+    StructField("created_on", TimestampType(), True)
+])
+
+def write_dq_result(row_dict):
+    spark.createDataFrame([row_dict], schema=dq_schema) \
+        .write.mode("append") \
+        .saveAsTable("ops_dq_result")
+
+def resolve_column_case_insensitive(df, column_name):
+    if is_blank(column_name):
+        return None
+
+    lookup = {c.lower(): c for c in df.columns}
+    return lookup.get(str(column_name).strip().lower())
+
+schema_df = spark.table("cfg_lims_table_schema")
+dataset_df = spark.table("cfg_lims_dataset").filter("active_flag = 'Y'")
+
+for ds in dataset_df.collect():
+    source_table = ds["source_table"]
+    bronze_table = ds["bronze_table"]
+
+    if not table_exists(spark, bronze_table):
+        print(f"Bronze table not found, skipping DQ for {bronze_table}")
+        continue
+
+    df = spark.table(bronze_table)
+
+    pk_rows = (
+        schema_df
+        .filter(f"source_table = '{source_table}'")
+        .filter("upper(is_primary_key) = 'Y'")
+        .orderBy("column_id")
+        .collect()
+    )
+
+    if len(pk_rows) == 0:
+        print(f"No PK defined, skipping DQ for {bronze_table}")
+        continue
+
+    pk_cols = []
+    for r in pk_rows:
+        actual_col = resolve_column_case_insensitive(df, r["column_name"])
+        if actual_col:
+            pk_cols.append(actual_col)
+
+    if len(pk_cols) == 0:
+        print(f"PK columns not found in actual table, skipping DQ for {bronze_table}")
+        continue
+
+    batch_ids = [
+        r["META_BATCH_ID"]
+        for r in df.select("META_BATCH_ID").distinct().collect()
+        if r["META_BATCH_ID"] is not None
+    ]
+
+    for batch_id in batch_ids:
+        bdf = df.filter(col("META_BATCH_ID") == batch_id)
+
+        null_condition = " OR ".join([f"`{c}` IS NULL" for c in pk_cols])
+        null_count = bdf.filter(null_condition).count()
+
+        write_dq_result({
+            "batch_id": batch_id,
+            "pipeline_run_id": "NA",
+            "source_system": "lims7",
+            "table_name": source_table,
+            "bronze_table": bronze_table,
+            "rule_name": "PK_NOT_NULL",
+            "rule_status": "PASS" if null_count == 0 else "FAIL",
+            "failed_count": null_count,
+            "created_on": utc_now()
+        })
+
+        dup_count = (
+            bdf.groupBy(*pk_cols)
+            .count()
+            .filter(col("count") > 1)
+            .count()
+        )
+
+        write_dq_result({
+            "batch_id": batch_id,
+            "pipeline_run_id": "NA",
+            "source_system": "lims7",
+            "table_name": source_table,
+            "bronze_table": bronze_table,
+            "rule_name": "PK_DUPLICATE_CHECK",
+            "rule_status": "PASS" if dup_count == 0 else "FAIL",
+            "failed_count": dup_count,
+            "created_on": utc_now()
+        })
+
+        print(f"{bronze_table} | {batch_id} | null_pk={null_count}, duplicate_pk={dup_count}")
+
+print("DQ checks completed.")
